@@ -1,0 +1,685 @@
+---
+title: "Demultiplexing"
+author: "Ramon Massoni-Badosa"
+date: "2019/04/08"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, out.width = "100%", fig.align='center', 
+                      message=FALSE, warning = FALSE)
+options(width = 1200)
+```
+
+
+# Introduction
+Robust protocols and automation now enable large-scale single-cell RNA sequencing (scRNA-seq) experiments and their application to population-wide association studies. Particularly, blood cell types are an attractive target due to their accessibility through biobanks that store large donor collections (healthy and diseased) and related metadata. However, before entering large-scale association projects merits a systematic benchmarking of technical biases that could critically impact on the results. Despite blood samples are generally cryopreserved and archived with standardized procedures, upfront sample processing can vary significantly even within cohorts. We hypothesize that particularly the time required to freeze a sample (range from hours to days) can distort cellular gene expression profiles and cell type composition and that scRNA-seq presents the most adequate techniques to detect such biases.
+
+We designed a benchmarking experiment to systematically test the effect of varying processing times before cryopreservation, while controlling for other sources of technical biases (Online Methods). We isolated peripheral blood mononuclear cells (PBMC) from two donors (male and female) and either preserved cells immediately (0 hours) or after 2, 8, 24 and 48 hours. This simulated common scenarios in biobanked blood cohorts. Droplet-based high-throughput 3`-transcript counting (Chromium Single Cell 3`) and high-resolution full-length (Smart-seq2) scRNA-seq were performed to monitor cell type composition, gene expression variance, cell and RNA integrity across preservation times.
+
+## Cell hashing description
+To assess the aformementioned effects, we needed a method to multiplex and sequence cells from all conditions together, as otherwise the main effect might be confounded by batch effects. To that end, we took advantage of the recently described [cell hashing method](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-018-1603-1) by the Satija lab. Briefly, each sample is uniquely labeled with a specific antibody against ubiquitously-expressed cell-surface markers. Each antibody is linked to a sample-specific hashtag oligonucleotide (HTO). This enables sample multiplexing, which rules out potential batch effect, reduces the library cost, and allows for doublet identification. However, a major challenge is to computationally demultiplex the library (i.e. assign each cell to the original sample). Herein, we will describe and carry out the pipeline used in the original paper to demultiplex our libraries.
+
+## Overview of our libraries
+In the present study, we have 4 libraries, corresponding to 2 batches (named "JULIA_03" and "JULIA_04") for each of the two donors (male and female). JULIA_03 and JULIA_04 have 4 and 8 conditions, respectively.  These conditions were labeled accordingly with specific HTO-linked antibodies:
+
+- JULIA_03: "0h", "8h", "24h" and "24h 4ºC" (4 conditions)
+- JULIA_04: "0h", "2h", "8h", "24h", "24h_Biobank", "48h", "24h 4ºC", "48h 4ºC" (8 conditions)
+
+Where "h" refer to how many hours a blood sample spent at room temperature before cryopreservation. Once we have demultiplexed the samples, we aim to assess whether cells cluster by time or by cell type. In other words, we aim to assess whether time is a source of technical biases.
+
+In this first notebook, we will perform the cell hashing demultiplexing to assign each cell back to each original sample.
+
+# Pre-processing
+
+## Package loading
+
+```{r}
+library(Matrix)
+library(stringr)
+library(psych)
+library(kmed)
+library(pheatmap)
+library(fitdistrplus)
+library(ggpubr)
+library(SingleCellExperiment)
+library(scater)
+library(scran)
+library(SC3)
+library(grid)
+library(purrr)
+library(gridExtra)
+library(gridGraphics)
+library(cowplot)
+library(tidyverse)
+```
+
+## Source script with function definitions
+
+```{r}
+source("bin/utils.R")
+```
+
+## Data import
+Let us start by importing the following files:
+
+- Gene expression matrix (matrix.mtx.gz), which contains the unique molecular identifiers (UMI) for >30,000 genes + HTO. Note that the matrix is stored as a sparse matrix (.mtx.gz file), so we need to coerce it to a regular matrix. 
+- Cell barcodes (barcodes.tsv.gz), which uniquely identify each cell and correspond to the column names of the expression matrix.
+- Feature identifiers (features.tsv.gz), which contains the ensembl gene ids (= row names of the matrix), the gene symbols and the status (gene or HTO).
+
+As for both batches we have data for both donors, we will import a total of 12 files:
+
+```{r}
+date <- Sys.Date()
+batches <- c("JULIA_03", "JULIA_04")
+donors <- c("male", "female")
+data <- list()
+
+for (batch in batches) {
+  for (donor in donors) {
+    # Define file paths
+    matrix_dir <- str_c("data/10X/", batch, "/", donor, "/")
+    barcode_path <- str_c(matrix_dir, "barcodes.tsv.gz")
+    features_path <- str_c(matrix_dir, "features.tsv.gz")
+    matrix_path <- str_c(matrix_dir, "matrix.mtx.gz")
+    
+    # Load files: expression matrix, barcodes and features names
+    feature_names <- read.delim(
+      features_path, 
+      header = FALSE,
+      stringsAsFactors = FALSE
+    )
+    colnames(feature_names) <- c("id", "name", "type")
+    barcode_names <- read.delim(
+      barcode_path,
+      header = FALSE,
+      stringsAsFactors = FALSE
+    )
+    colnames(barcode_names) <- "barcode"
+    mat <- readMM(file = matrix_path)
+    rownames(mat) <- feature_names$id
+    colnames(mat) <- barcode_names$barcode
+    
+    # Add loaded data to the "data" list
+    data[[batch]][[donor]][["features"]] <- feature_names
+    data[[batch]][[donor]][["barcodes"]] <- barcode_names
+    data[[batch]][[donor]][["matrix"]] <- as.matrix(mat)
+  }
+}
+```
+
+
+## Create SingleCellExperiment object
+We will store our data into a `SingleCellExperiment` object, a container specialized to work with scRNA-seq data. It lets us store in a single object the expression matrix, the cell metadata, the gene metadata, the spike-ins and dimensionality reduction parameters, among others. Furthermore, it has special getter/setter methods that make it easier to access and subset the data. The input to the SCE is the following:
+
+1. Expression matrix: stored in the "matrix" variable in the "data" list, with rownames corresponding to ensembl gene ids and colnames corresponding to the cell barcodes. As at the moment we have 4 matrices (2 donors for each of the 2 batches), we first need to combine them into a single matrix (expr_matr). However, as both JULIA_04 matrices have 4 more rows (4 more conditions), we will add 0 rows to JULIA_03 matrices.
+2. Cell metadata (cell_meta): data frame that encodes 2 variables for each cell: batch ("JULIA_03" or "JULIA_04"), and donor ("male" or "female").
+3. Gene metadata: dataframe that contains 3 variables for each gene: id (ensembl gene ids), name (the gene symbol), and type ("Gene Expression" or "Antibody Capture").
+
+```{r}
+# Remove M_ and F_ from the time-point values in features and matrix rownames
+for (batch in batches) {
+  for (donor in donors) {
+    feat_ids <- str_remove(
+      string = data[[batch]][[donor]][["features"]][["id"]], 
+      pattern = "^._"
+    )
+    data[[batch]][[donor]][["features"]][["id"]] <- feat_ids
+    rownames(data[[batch]][[donor]][["matrix"]]) <- feat_ids
+  }
+}
+
+# Add missing conditions to JULIA_03 (2h, 24h_RT_biobank, 48h_RT, 48h_4C)
+setdiff(data$JULIA_04$male$features$id, data$JULIA_03$male$features$id)
+for (donor in donors) {
+  curr_matr <- data[["JULIA_03"]][[donor]][["matrix"]]
+  miss_mat <- matrix(
+    rep(0, 4 * ncol(curr_matr)), 
+    nrow = 4,
+    ncol = ncol(curr_matr)
+  )
+  rownames(miss_mat) <- c("2h", "24h_RTBioabank", "48h_RT", "48h_4C")
+  curr_matr <- rbind(curr_matr, miss_mat)
+  selec <- rownames(curr_matr) == "24h"
+  rownames(curr_matr)[selec] <- "24h_RT"
+  row_id <- rownames(curr_matr)
+  row_order <- c(str_subset(row_id, "^ENSG"), "0h", "2h", "8h", "24h_RT", 
+                 "24h_4C", "24h_RTBioabank", "48h_RT", "48h_4C")  
+  curr_matr <- curr_matr[row_order, ]
+  data[["JULIA_03"]][[donor]][["matrix"]] <- curr_matr
+}
+
+# Join all expression matrices into one, recoding redundant barcodes
+matr_list <- c(map(data$JULIA_03, "matrix"), map(data$JULIA_04, "matrix"))
+all_barcodes <- unlist(map(matr_list, colnames))
+rep_barcodes <- sort(table(all_barcodes) > 1, decreasing = TRUE)
+rep_barcodes <- names(rep_barcodes)[rep_barcodes]
+all_barcodes[match(rep_barcodes, all_barcodes)] <- str_c(rep_barcodes, ".1")
+all_barcodes[match("GCATGTAAGCTAGCCC-1", all_barcodes)] <- "GCATGTAAGCTAGCCC-1.2" 
+expr_matr <- Reduce(cbind, matr_list)
+names(all_barcodes) <- NULL
+colnames(expr_matr) <- all_barcodes
+rm(matr_list)
+
+# Create the cell annotation data frame: cell_meta
+batch_num <- map_dbl(data, ~ nrow(.$male$barcodes) + nrow(.$female$barcodes))
+donor_num <- map(data, ~ c(nrow(.$male$barcodes), nrow(.$female$barcodes)))
+cell_meta <- data.frame(
+  batch = c(rep("JULIA_03", batch_num[1]), rep("JULIA_04", batch_num[2])),
+  donor = c(rep("male", donor_num$JULIA_03[1]), 
+            rep("female", donor_num$JULIA_03[2]),
+            rep("male", donor_num$JULIA_04[1]),
+            rep("female", donor_num$JULIA_04[2])),
+  stringsAsFactors = FALSE
+)
+rownames(cell_meta) <- all_barcodes
+
+# Create the gene annotation data frame: gene_meta
+gene_meta <- data$JULIA_04$male$features
+
+# Create SingleCellExperiment object
+names(colnames(expr_matr)) <- NULL
+hto <- SingleCellExperiment(
+  assays = list(counts = expr_matr),
+  rowData = gene_meta,
+  colData = cell_meta
+)
+hto
+
+# Remove genes not expressed in any cell
+keep_feature <- rowSums(counts(hto)) > 0
+hto <- hto[keep_feature, ]
+```
+
+We can depict the distribution of cells across batches and donors:
+
+```{r}
+table(hto$batch, hto$donor)
+```
+ 
+##Batch effect detection
+To demultiplex the cells, we have two options:
+
+1. Use all cells from different batches in the same matrix and demultiplex them.
+2. Separate cells into their respective batch and demultiplex them separately.
+
+To guide this decision, we need to assess whether our independent variables (batch and donor) are introducing batch effects to the HTO UMI. If that's the case, we will choose option (2), as otherwise our conclusions might be affected by technical artifacts. 
+
+We can visualize such batch effects with a tSNE. First, let us filter the SCE so we only retain the expression of the HTO.
+
+```{r}
+# Filter SCE to retain hashtag expression
+hto_filt <- hto[rowData(hto)$type == "Antibody Capture", ]
+
+# Run and plot tSNE
+hto_filt <- runTSNE(hto_filt, exprs_values = "counts")
+hto_tsne_df <- reducedDim(hto_filt, "TSNE") %>% 
+  as.data.frame() %>%
+  set_colnames(c("TSNE1", "TSNE2")) %>% 
+  dplyr::mutate(batch = hto_filt$batch, donor = hto_filt$donor)
+hto_tsne_batch <- hto_tsne_df %>% 
+  ggplot(aes(TSNE1, TSNE2, color = batch)) +
+  geom_point(size = 1, alpha = .85, shape = 1) +
+  scale_color_manual(values = c("#D55E00", "#0072B2")) +
+  theme_classic() +
+  theme(legend.text = element_text(size = 14))
+
+hto_tsne_donor <- hto_tsne_df %>% 
+  ggplot(aes(TSNE1, TSNE2, color = donor)) +
+  geom_point(size = 1, alpha = .85, shape = 1) +
+  scale_color_manual(values = c("#009E73", "#CC79A7")) +
+  theme_classic() +
+  theme(legend.text = element_text(size = 14))
+ggarrange(
+  plotlist = list(hto_tsne_batch, hto_tsne_donor),
+  nrow = 1, 
+  ncol = 2
+)
+```
+
+As we can see, "batch" and "donor" are important sources of HTO variability. Thus, we will choose to normalize and demultiplex them separately, as otherwise it would bias our classification.
+
+# Hashtag Oligonucleotides normalization and distribution
+We normalize the HTO using a centered log ratio (CLR): divide HTO UMIs by the geometric mean across cells and log-transform (with prior counts to avoid dividing by 0). With this transformation, UMI greater than the geometric mean will be positive, and UMI lower than the geometric mean will be negative. Remember that we will normalize each condition and donor separately, so we will split the hto_filt into a list of 4 SCE.
+
+```{r}
+# Define a list of filtered  and normalized SCE that contain HTO expression
+julia_04_uniq <- c("2h", "24h_RTBioabank", "48h_RT", "48h_4C")
+hto_list <- list()
+for (batch in batches) {
+  for (donor in donors) {
+    curr_hto <- hto_filt[, hto_filt$batch == batch & hto_filt$donor == donor]
+    if (batch == "JULIA_03") {
+      curr_hto <- curr_hto[!(rownames(curr_hto) %in% julia_04_uniq), ]
+    }
+    curr_hto <- normalize_hash(curr_hto)
+    hto_list <- c(hto_list, curr_hto)
+  }
+}
+names(hto_list) <- c("03_male", "03_female", "04_male", "04_female")
+```
+
+We will change the labels of "24h_4C" and "24h_RTBiobank" from the JULIA_04 batch, as they were mislabeled when processing the samples in the lab (see data/10X_JULIA_04_2112019.xlsx). 
+
+```{r}
+rownames_corrected <- c("0h", "2h", "8h", "24h_RT", "24h_RTBioabank", "24h_4C", "48h_RT", "48h_4C")
+rownames(hto_list$`04_male`) <- rownames_corrected
+rownames(hto_list$`04_female`) <- rownames_corrected
+```
+
+We can visualize the distribution of each normalized HTO expression across cells:
+
+```{r}
+# Create data frame from the normalized expression matrix
+hto_df_l <- map(hto_list, function(x) {
+  df_norm <- logcounts(x) %>% 
+    t() %>% 
+    as.data.frame() %>% 
+    rownames_to_column(var = "barcode") %>% 
+    gather(key = "hashtag", value = "norm_counts", -"barcode") %>% 
+    dplyr::mutate(hashtag = factor(hashtag, levels = rownames(logcounts(x))))
+  df_norm
+})
+df_norm <- hto_df_l %>% 
+  bind_rows(.id = "batch") %>% 
+  separate(batch, c("batch", "donor"), "_") %>%
+  mutate(batch = ifelse(batch == "03", "JULIA_03", "JULIA_04"),
+         hashtag = factor(hashtag, levels = rownames(hto_filt)),
+         donor = factor(donor, levels = c("male", "female")))
+
+levels(df_norm$hashtag) <- c("0h", "2h", "8h", "24h", "24h 4ºC", 
+                             "24h Bioabank", "48h", "48h 4ºC") 
+# Plot HTO distributions
+hto_distr_gg <- map(batches, function(x) {
+  df_norm %>% 
+    filter(batch == x) %>% 
+    ggplot(aes(norm_counts)) +
+      geom_histogram(bins = 100, fill = "black", color = "black", alpha = 0.6) +
+      facet_grid(donor ~ hashtag) +
+      xlab("normalized hashtag counts") +
+      ggtitle(str_c("Hashtag Oligonucleotides Distributions (", x, ")")) +
+      theme_bw() +
+      theme(plot.title = element_text(hjust = 0.5),
+            strip.text = element_text(size = 11))
+})
+
+# Save plot and dataframe
+file_end <- "_hto_distr.pdf"
+walk2(hto_distr_gg, batches, 
+  ~ ggsave(
+      plot = .x, 
+      filename = str_c("results/plots/demultiplexing/", date, "_", .y, file_end),
+      device = "pdf", 
+      width = 13, 
+      height = 6
+    )
+)
+write.table(
+  df_norm, 
+  file = "results/tables/hto_distr.tsv", sep = "\t"
+)
+hto_distr_gg
+```
+
+As we can see, some HTO distributions are bimodal, which indicates that we can distinguish a background expression (first peak) and a signal expression (second peak). This is the ideal scenario, as we will easily demultiplex cells from these conditions. Conversely,  some HTO distributions are right skewed or unimodal, which indicates that the background predominates the signal. In those cells we will have a harder time demultiplexing and assigning them to the right condition.
+
+# Cluster cells by HTO expression
+To be able to properly demultiplex the cells, we need to identify the background HTO distribution. To that end, we will perform unsupervised clustering (k-medoids), with k = 4 in JULIA_03 and k = 8 in JULIA_04, according to the number of conditions. Our purpose is to find, for each HTO, a cluster of cells with high expression of that HTO. In downstream analysis, for a given HTO we will remove the cells falling into that cluster to find the background expression, which we will exploit to model the noise associated to each HTO.
+
+As described in the paper from the Satija lab, we will use k-medoids. A key parameter of this clustering algorithm is the distance metric. Hence, for each batch and donor we will run k-medoids 4 times, using either Manhattan weighted by rank ("mrw"), Squared Euclidean weighted by variance ("sev"), Squared Euclidean weighted by rank ("ser"), and Squared Euclidean ("se"). Then, by visualizing the resulting heatmap we will decide which distance to use for each donor and batch:
+
+```{r fig.keep = 'none'}
+distances <- c("mrw", "sev", "ser", "se")
+heatmaps_prov <- list()
+for (dis in distances) {
+  # Use k-medoids to cluster cells
+  hto_list <- map2(
+    hto_list, 
+    c(4, 4, 8 , 8), 
+    ~ cluster_cells_by_hash(.x, .y, dist = dis)
+  )
+  
+  # Plot heatmap to visualize the clusters
+  heatmaps_prov[[dis]] <- map2(
+    hto_list, 
+    names(hto_list), 
+    ~ plot_heatmap(.x, "logcounts", .y)
+  )
+}
+```
+
+We can arrange them in grids:
+
+```{r}
+walk2(heatmaps_prov, names(heatmaps_prov), ~ grid.arrange(
+  grobs = map(.x, 4), 
+  ncol = 2, 
+  clip = TRUE,
+  top = textGrob(str_c("Dist = ", .y), gp = gpar(fontsize = 20))
+ )
+)
+```
+
+We can see that, whilst for the JULIA_03 cells the distance metric does not matter whatsoever (the clusters are robust), for the JULIA_04 cells it has a major impact. Particularly, we can see that for the male donor in JULIA_04, Squared Euclidean weighted by variance is the metric that enables a better clustering; while for the female donor is Squared Euclidean. Therefore, we will cluster cells with these distance metrics:
+
+```{r fig.keep = 'none'}
+# Use k-medoids to cluster cells
+hto_list <- pmap(
+  list(hto_list, c(4, 4, 8 , 8), c("sev", "sev", "sev", "se")), 
+  ~ cluster_cells_by_hash(..1, ..2, dist = ..3)
+)
+
+# Plot heatmap to visualize the clusters
+heatmaps_list <- map2(hto_list, names(hto_list), ~ plot_heatmap(.x, "logcounts", .y))
+```
+
+```{r}
+grid.arrange(
+  grobs = map(heatmaps_list, 4), 
+  ncol = 2, 
+  clip = TRUE
+)
+```
+
+Notably, we can observe the following patterns:
+
+1. In the JULIA_03 female donor, the 4 clusters are easiliy distinguishable. However, their sizes are very different: while a lot of cells fall into the 0h and 24h clusters, few cells fall into the 24h_4ºC. This is consistent with the HTO distributions, as with the former hasthags there are two clear peaks (background and signal), and for the latter there is only a heavy right tail. This diminishes our ability to detect doublets, as for instance there will be a higher proportion of 2X 24h cells, which we will not be able to distinguish.
+
+2. In the JULIA_03 male donor, the 24h_4C is only composed of background noise, consistent with its unimodal distribution. Thus, we will not be able to confidently assign any cell to this condition and, consequently, we need to run again the k-medoids clustering with k = 3. 
+
+3. In the JULIA_04 female donor we can depict 8 clusters. Again, the cluster sizes are highly heterogeneous.
+
+4. In the JULIA_04 male donor, there is a cluster with a high overlapping between 0h and 24h_4C.
+
+In the code chunk that follows, we will recluster the cells in male_03 with k = 3, and rename the clusters to obtain a heatmap with a strong leading diagonal, which enhances interpretability.
+
+```{r fig.keep = 'none'}
+# Recluster cells changing k
+hto_list[["03_male"]] <- cluster_cells_by_hash(hto_list[["03_male"]],  k = 3)
+heatmaps_list[["03_male"]] <- plot_heatmap(hto_list[["03_male"]], title = "03_male")
+
+# Recode cluster labels, so in the heatmap appears a strong diagonal
+cluster_labels <- list(
+  "03_male" = c(3, 1, 2), 
+  "03_female" = c(1, 2, 3, 4),
+  "04_male" = c(5, 8, 7, 4, 2, 1, 6, 3),
+  "04_female" = c(4, 3, 1, 6, 5, 8, 7, 2)
+)
+hto_list <- map(names(hto_list), function(x) {
+  clust <- factor(hto_list[[x]][["cluster"]]) 
+  levels(clust) <- cluster_labels[[x]]
+  clust <- ordered(clust, 1:length(clust))
+  hto_list[[x]][["cluster"]] <- clust
+  hto_list[[x]]
+})
+names(hto_list) <- names(cluster_labels)
+
+# Replot heatmaps
+heatmaps_list <- map2(hto_list, names(hto_list), ~ plot_heatmap(.x, title = .y, annotation = FALSE))
+```
+```{r}
+dir <- "results/plots/demultiplexing/"
+for (name in names(heatmaps_list)) {
+  pdf(str_c(dir, date, "_", name, "_k-medoids_heatmaps.pdf"), width = 12, height = 10)  
+  print(heatmaps_list[[name]])
+  dev.off()
+}
+grid.arrange(
+  grobs = map(heatmaps_list, 4), 
+  ncol = 2, 
+  clip = TRUE,
+  top = textGrob("03_male", gp = gpar(fontsize = 20))
+)
+```
+
+Identify and assign the highest HTO per cluster (signal)
+
+```{r}
+hto_list <- map(hto_list, function(x) {
+  x$cluster <- factor(x$cluster, ordered = FALSE)
+  levels(x$cluster) <- rownames(x)
+  x
+})
+```
+
+For each condition, we consider the cells falling within that cluster as signal, so we will remove them and consider as background the remaining cells. From the background distribution, we will establish a threshold to classify a given HTO as signal, so that it is extremely unlikely to get that value by chance alone.
+
+## Demultiplex and classify each cell
+To demultiplex the cells:
+
+1. Exclude cells from the cluster in which the HTO is highly expressed.
+2. Exclude highest 0.5% values as potential outliers.
+3. Fit a negative binomial distribution. A negative binomial distribution is appropriate when the variance of a quantitative variable exceeds its mean, so it is frequent to find extreme values.
+4. Calculate q=0.99 quantile of the fitted distribution.
+5. Use the threshold in (4) to assign each cell (barcode) to an HTO.
+
+To fit a negative binomial distribution we need both positive and integer numbers, so we will transform the normalized counts. The function that implements this algorithm is `classify_cells_by_hash()` and can be found in the script "utils.R".
+
+The most important variable in the following chunk is classification_mat, which is a logical matrix with the barcodes as columns and the HTO as rows. For each barcode and HTO, the given entry will be TRUE if the algorithm classifies that cell (barcode) into that condition (HTO), and FALSE otherwise. We will detect as multiplets those barcodes that contain more than one TRUE entry.
+
+Importantly, we will rule out the cells in the 24h_4C cluster of male_04, as they contain a high expression of the 0h HTO, so keeping the former cells would mean biasing the background estimation of 0h.
+
+```{r}
+# Exclude cells cluster 24h_RTBioabank for male_04
+exclude_lgl <- hto_list$`04_male`$cluster == "24h_4C"
+exclude_bar <- colnames(hto_list$`04_male`[, exclude_lgl])
+hto_list$`04_male` <- hto_list$`04_male`[, !(exclude_lgl)]
+hto_list$`04_male`$cluster <- droplevels(hto_list$`04_male`$cluster)
+hto_list$`03_male`$cluster <- droplevels(hto_list$`03_male`$cluster)
+
+# Classify cells
+hto_list$`03_male` <- hto_list$`03_male`[c("0h", "8h", "24h_RT"), ]
+selec <- c("0h", "2h", "8h", "24h_RT" ,"24h_RTBioabank", "48h_RT", "48h_4C")
+hto_list$`04_male` <- hto_list$`04_male`[selec, ]
+cond_list <- map(hto_list, rownames)
+hto_list <- map2(hto_list, cond_list, ~ classify_cells_by_hash(.x, .y))
+
+# Plot thresholds for each HTO distribution
+hto_distr_gg[[1]] <- plot_thresholds(
+  gg = hto_distr_gg[[1]], 
+  threshs = metadata(hto_list$`03_female`)$classification_thresholds, 
+  df = df_norm, 
+  don = "female", 
+  bat = "JULIA_03"
+)
+hto_distr_gg[[1]] <- plot_thresholds(
+  gg = hto_distr_gg[[1]], 
+  threshs = metadata(hto_list$`03_male`)$classification_thresholds, 
+  df = df_norm, 
+  don = "male", 
+  bat = "JULIA_03"
+)
+hto_distr_gg[[1]]
+hto_distr_gg[[2]] <- plot_thresholds(
+  gg = hto_distr_gg[[2]], 
+  threshs = metadata(hto_list$`04_female`)$classification_thresholds, 
+  df = df_norm, 
+  don = "female", 
+  bat = "JULIA_04"
+)
+hto_distr_gg[[2]] <- plot_thresholds(
+  gg = hto_distr_gg[[2]], 
+  threshs = metadata(hto_list$`04_male`)$classification_thresholds, 
+  df = df_norm, 
+  don = "male", 
+  bat = "JULIA_04"
+)
+hto_distr_gg[[2]]
+names(hto_distr_gg) <- batches
+walk(batches, function(x) {
+  ggsave(
+    plot = hto_distr_gg[[x]],
+    filename = str_c("results/plots/demultiplexing/", date, "_", x, "_thresholds_hto_distr.pdf"),
+    device = "pdf", 
+    width = 13, 
+    height = 6
+  )
+})
+```
+
+We can visualize the previous assignment with a heatmap:
+
+```{r}
+heatmaps_assign <- map(names(hto_list), ~ plot_heatmap2(
+  sce = hto_list[[.]],
+  title = .
+  )
+)
+```
+
+
+### Final SingleCellExperiment object
+
+**Remark** : As in the analysis carried out in downstream notebooks we decided to remove the "24h_Biobank" sample, we will remove it right away so it does not interfere with our interpretations for other time-points.
+
+```{r}
+hto <- hto[rowData(hto)$type == "Gene Expression", 
+           !(colnames(hto) %in% exclude_bar)]
+condition_def <- c(
+  hto_list$`03_male`$cell_identity,
+  hto_list$`03_female`$cell_identity,
+  hto_list$`04_male`$cell_identity,
+  hto_list$`04_female`$cell_identity
+)
+hto$condition <- condition_def
+hto <- hto[, hto$condition != "24h_RTBioabank"]
+
+# Save SingleCellExperiment object
+saveRDS(object = hto, file = "results/R_objects/SCE_demultiplexed.RDS")
+```
+
+### Assignment summary
+We can visualize the final classification. Heatmap:
+
+```{r}
+hto_list2 <- hto_list
+julia_04_id <- c("04_male", "04_female")
+hto_list2[julia_04_id] <- map(hto_list2[julia_04_id], function(sce) {
+  sce <- sce[rownames(sce) != "24h_RTBioabank", sce$cell_identity != "24h_RTBioabank"]
+  metadata(sce)$classification_matrix <- metadata(sce)$classification_matrix[rownames(sce), ]
+  sce
+})
+heatmaps_assign2 <- map(names(hto_list2), ~ plot_heatmap2(
+  sce = hto_list2[[.]],
+  title = ""
+  )
+)
+names(heatmaps_assign2) <- names(hto_list2) 
+walk(names(heatmaps_assign2), function(heatmap) {
+  filename = str_c(
+    "results/plots/demultiplexing/", 
+    date, 
+    "_",  
+    heatmap, 
+    "_demultiplex_heatmap.pdf"
+  )
+  pdf(file = filename, width = 8, height = 6.5)
+  print(heatmaps_assign2[[heatmap]])
+  dev.off()
+})
+```
+
+Bar plot:
+
+```{r}
+new_lev <- c("unassigned", "0h", "2h", "8h", "24h", 
+             "48h", "24h 4ºC", "48h 4ºC")
+class_barplots <- list()
+for (bat in batches) {
+  for (don in donors) {
+    plot_lab <- str_c(bat, don, sep = " ")
+    curr_df <- colData(hto) %>% 
+    as.data.frame() %>% 
+    group_by(batch, donor, condition) %>% 
+    summarise(number = n()) %>% 
+    mutate(condition = str_remove(condition, "_RT")) %>% 
+    mutate(condition = str_replace(condition, "_4C", " 4ºC")) %>% 
+    mutate(condition = factor(condition, levels = rev(new_lev))) %>% 
+    mutate(is_assigned = ifelse(condition == "unassigned", FALSE, TRUE)) %>% 
+    filter(batch == bat, don == donor)
+    class_barplots[[plot_lab]] <- curr_df %>% 
+      ggplot(aes(condition, number, fill = is_assigned)) +
+        geom_col(position = "dodge") +
+        geom_text(aes(label = number), hjust = -0.25, size = 3) +
+        scale_y_continuous(limits = c(0, max(curr_df$number) + 400)) +
+        scale_fill_manual(values = c("red", "darkgreen")) +
+        labs(x = "", y = "Number of cells", fill = "") +
+        theme_bw() +
+        theme(legend.position = "none", 
+              axis.text.y = element_text(size = 9),
+              plot.margin = unit(c(0,0,0,0), "cm")) +
+        coord_flip()
+  }
+}
+classification_gg <- ggarrange(plotlist = class_barplots, nrow = 2, ncol = 2)
+dir <- "results/plots/demultiplexing/"
+walk(names(class_barplots), function(gg) {
+  ggsave(
+    plot = class_barplots[[gg]],
+    filename = str_c(dir, date, "_",  gg, "_cell_classification_count.pdf"),
+    height = 7,
+    width = 7
+  )
+})
+ggsave(
+  plot = classification_gg, 
+  filename = str_c(dir, date, "_cell_classification_count.pdf"), 
+  device = "pdf", 
+  height = 9, 
+  width = 9
+)
+walk(class_barplots, print)
+```
+
+# Demultiplex figure 
+
+```{r}
+heats <- map(heatmaps_assign2, 4)
+heatmaps_column <- plot_grid(
+  heats[[1]], 
+  heats[[2]], 
+  heats[[3]],
+  heats[[4]],
+  nrow = 4, 
+  ncol = 1,
+  align = "hv"
+)
+barplots_column <- plot_grid(
+  NULL,
+  class_barplots[[1]], 
+  NULL,
+  class_barplots[[2]], 
+  NULL,
+  class_barplots[[3]], 
+  NULL,
+  class_barplots[[4]], 
+  nrow = 8, 
+  ncol = 1, 
+  align = "hv",
+  rel_heights = c(0.1, 1, 0.15, 1, 0.15, 1, 0.15, 1)
+)
+demux_fig <- plot_grid(
+  NULL,
+  heatmaps_column, 
+  barplots_column, 
+  NULL,
+  nrow = 1, 
+  ncol = 4, 
+  align = "hv", 
+  rel_widths = c(0.05, 0.5, 0.5, 0.05)
+)
+ggsave(
+  plot = demux_fig, 
+  filename = str_c(dir, date, "_",  "demultiplex_figure.pdf"),
+  height = 16,
+  width = 8
+)
+demux_fig
+```
+
+#Session Info
+
+```{r}
+sessionInfo()
+```
+
+

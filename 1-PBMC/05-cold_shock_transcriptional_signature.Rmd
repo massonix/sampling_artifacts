@@ -1,0 +1,576 @@
+---
+title: "Cold Shock Transcriptional Signature"
+author: "Ramon Massoni-Badosa"
+date: "10/21/2019"
+output: 
+  BiocStyle::html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, out.width = "100%", fig.align='center', 
+                      message=FALSE, warning = FALSE)
+options(width = 1200)
+```
+
+
+# Introduction
+The objective of this notebook is to characterize the transcriptional signature associated with time at room temperature (RT) until cryopreservation in Peripheral Blood Mononuclear Cells (PBMC). We hypothesize that, as we are extracting blood cells from its physiological niche (~37ºC) and placing them at RT (~21ºC), they will express a transcriptional that allows them to cope to the change in temperature.
+
+# Pre-processing
+
+## Package loading
+
+```{r}
+library(scater)
+library(scran)
+library(Seurat)
+library(ggpubr)
+library(biomaRt)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(GOplot)
+library(GOstats)
+library(topGO)
+library(ggrepel)
+library(ggridges)
+library(viridis)
+library(pheatmap)
+library(tidyverse)
+```
+
+## Source script with functions
+
+```{r}
+source("bin/utils.R")
+```
+
+## Load data
+We dispose of a demultiplexed, filtered, normalized and annotated Seurat object that contains the transcriptome and metadata  of >10,000 Peripheral Blood Mononuclear Cells (PBMC) from two donors (male/female) that were kept at varying times at RT (0h, 2h, 8h, 24h, 48h).
+
+```{r}
+pbmc <- readRDS("results/R_objects/10X_pbmc_Seurat_clustered.RDS")
+pbmc <- subset(pbmc, subset = condition %in% c("0h", "2h", "8h", "24h_RT", "48h_RT"))
+pbmc$time <- factor(pbmc$condition, levels = c("0h", "2h", "8h", "24h_RT", "48h_RT"))
+levels(pbmc$time) <-  c("0h", "2h", "8h", "24h", "48h")
+Idents(pbmc) <- "cell_type"
+DimPlot(pbmc)
+```
+
+# Transcriptional signature
+To find the transcriptional signature associated with time, we will conduct a differential expression analysis between time-biased and time-unbiased cells. Such distinction is based in our previous results, which show that cells that are >2h at RT prior to cryopreservation possess altered transcriptional landscapes in comparison to those left for <=2h.
+
+We will opt to use a wilcoxon test. Despite the fact that there are recent methods that are tailored to scRNA-seq DE, recent benchmarking suggest that [(1)](https://www.nature.com/articles/nmeth.4612) wilcoxon test is still among the best-performing tools and [(2)](https://www.biorxiv.org/content/10.1101/583013v2.full) with scran normalization there is no need for tailored methods.
+
+First, let us assess the differential expression analysis for all cell types together:
+
+```{r}
+pbmc$is_biased <- ifelse(pbmc$time %in% c("0h", "2h"), "unbiased", "biased")
+Idents(pbmc) <- "is_biased"
+dea_general <- FindMarkers(pbmc, ident.1 = "biased", test.use = "wilcox")
+dea_general <- dea_general %>%
+  rownames_to_column(var = "gene") %>% 
+  dplyr::mutate(is_significant = ifelse(p_val_adj < 0.001, TRUE, FALSE))
+genes <- rownames(pbmc[["RNA"]]@data)
+avg_expr <- rowMeans(as.matrix(pbmc[["RNA"]]@data))
+log2_fc <- apply(as.matrix(pbmc[["RNA"]]@data), 1, function(x) {
+  mean_unbiased <- mean(x[pbmc$is_biased == "unbiased"]) + 1
+  mean_biased <- mean(x[pbmc$is_biased == "biased"]) + 1
+  log2(mean_biased / mean_unbiased)
+})
+is_significant <- ifelse(genes %in% dea_general$gene[dea_general$is_significant], TRUE, FALSE)
+dea_all <- data.frame(
+  gene = genes, 
+  average_expression = avg_expr, 
+  log2_fc = log2_fc,
+  is_significant = is_significant
+)
+subset_sig <- dplyr::filter(dea_all, is_significant & log(average_expression + 1) > 0.5 & abs(log2_fc) > 0.2)
+top_up <- as.character(subset_sig$gene[subset_sig$log2_fc > 0])
+top_down <- subset_sig %>% 
+  dplyr::arrange(log2_fc)
+top_down <- as.character(top_down$gene[1:10])
+subset_sig <- dplyr::filter(subset_sig, gene %in% c(top_up, top_down))
+ma_plot_all <- dea_all %>% 
+  ggplot(aes(log(average_expression + 1), log2_fc, color = is_significant)) +
+    geom_point(size = 0.85, alpha = 0.6) +
+    geom_smooth(method = "loess", color = "darkblue") +
+    geom_hline(yintercept = 0, color = "black", linetype = "dashed") +
+    scale_color_manual(values = c("gray78", "green4"), labels = c("sig", "no sig")) +
+    labs(x = "log (Average Expression)", y = "log (biased / unbiased)", color = "") +
+    theme_classic2() +
+    theme(axis.title = element_text(size = 11),
+          legend.text = element_text(size = 11),
+          plot.title = element_text(hjust = 0.5, face = "bold"))
+ma_plot_all +    
+  geom_text_repel(data = subset_sig, aes(label = gene), color = "black") 
+saveRDS(ma_plot_all, "results/R_objects/ggplots/ma_plot_all_types_pbmc.rds")
+dea_all <- arrange(dea_all, desc(abs(log2_fc)))
+saveRDS(dea_general$gene, "results/R_objects/cold_shock_signature.rds")
+saveRDS(dea_general$gene[dea_general$avg_logFC > 0], "results/R_objects/cold_shock_signature_up.rds")
+saveRDS(dea_all, "results/R_objects/dea_results_pbmc.rds")
+```
+
+Overall, we detected a total of `r sum(dea_general$is_significant)` differential expressed genes (DEG), `r sum(dea_general$is_significant & dea_general$avg_logFC > 0)` of which were upregulated and `r sum(dea_general$is_significant & dea_general$avg_logFC < 0)` were downregulated.
+
+Let's visualize the same information with a dot plot:
+
+```{r}
+expr_matr <- scale(as.matrix(pbmc[["RNA"]]@data), TRUE, TRUE)
+meta_df <- data.frame(
+  time = c(), 
+  gene = c(),
+  expression = c(), 
+  fraction_expr = c()
+)
+times <- c("0h", "2h", "8h", "24h", "48h")
+genes <- c(top_down, top_up)
+for (t in times) {
+  for (g in genes) {
+    cells <- colnames(pbmc)[pbmc$time == t]
+    expr <- mean(expr_matr[g, cells])
+    frc_expr <- mean(as.numeric(pbmc[["RNA"]]@counts[g, cells]) != 0) 
+    current_df <- data.frame(
+      gene = g, 
+      time = t, 
+      expression = expr, 
+      fraction_expr = frc_expr
+    )
+    meta_df <- rbind(meta_df, current_df)
+  }
+}
+dotplot <- meta_df %>%
+  group_by(gene) %>% 
+  mutate(scaled_expression = (expression - mean(expression)) / sd(expression)) %>% 
+  ungroup() %>% 
+  mutate(gene = factor(gene, levels = genes)) %>% 
+  ggplot(aes(x = time, y = gene, color = scaled_expression, size = fraction_expr)) +
+  geom_point() +
+  scale_colour_gradientn(colours = c("blue","white","red")) +
+  labs(x = "", y = "") +
+  theme_classic() +
+  theme(axis.text = element_text(size = 13), 
+        legend.text = element_text(size = 13), 
+        legend.title = element_text(size = 13), 
+        legend.position = "bottom", 
+        legend.box = "vertical")
+saveRDS(dotplot, file = "results/R_objects/ggplots/dotplot_top_genes_signature.rds")
+```
+
+Number of detected genes across time intervals:
+
+```{r}
+pbmc$processing <- case_when(
+  pbmc$time %in% c("0h", "2h") ~ "fresh", 
+  pbmc$time == "8h" ~ "local",
+  pbmc$time %in% c("24h", "48h") ~ "central"
+)
+df_supp_fig <- dplyr::select(pbmc@meta.data, "processing", "nFeature_RNA")
+saveRDS(df_supp_fig, "results/R_objects/ggplots/dataframe_ngenesVSprocessing_pbmc.rds")
+palette <- c("#999999", "#92e8df", "#632c63", "#e4624e", "#c0e212")
+n_detect_genes <- pbmc@meta.data %>%
+  mutate(is_biased = factor(is_biased, c("unbiased", "biased"))) %>% 
+  ggplot(aes(is_biased, nFeature_RNA, fill = is_biased)) +
+    geom_boxplot() +
+    labs(x = "", y = "Number of Detected Genes") +
+    theme_classic() +
+    theme(legend.position = "none")
+n_detect_genes
+t <- t.test(
+  nFeature_RNA ~ is_biased, 
+  data = pbmc@meta.data, 
+  alternative = "two.sided"
+)
+t$p.value
+```
+
+
+Then, we will perform the analysis for each cell type separately, as this will allow us to elucidate the specificity of the signature downstream:
+
+```{r}
+pbmc_types <- SplitObject(pbmc, split.by = "cell_type")
+pbmc_types <- purrr::map(pbmc_types, pre_process_seurat)
+dea_list <- purrr::map(pbmc_types, function(seurat) {
+  seurat$is_biased <- ifelse(seurat$time %in% c("0h", "2h"), "unbiased", "biased")
+  Idents(seurat) <- "is_biased"
+  dea <- FindMarkers(seurat, ident.1 = "biased", test.use = "wilcox", logfc.threshold = 0, min.pct = 0)
+  dea <- dea %>%
+    rownames_to_column(var = "gene") %>% 
+    mutate(is_significant = ifelse(p_val_adj < 0.001, TRUE, FALSE))
+  avg_expr <- rowMeans(as.matrix(seurat[["RNA"]]@data[dea$gene, ]))
+  dea$avg_expr <- avg_expr
+  dea
+})
+saveRDS(dea_list, "results/R_objects/dea_results_per_cell_type.rds")
+# dea_list <- readRDS("results/R_objects/dea_results_per_cell_type.rds")
+```
+
+Let us assess the overall distribution of the diferentially expressed genes (DEG) with an MA plot:
+
+```{r}
+ma_plot_list <- purrr::map2(dea_list, names(dea_list), function(dea, donor) {
+  subset_sig <- filter(dea, is_significant & log(avg_expr + 1) > 0.4 & abs(avg_logFC) > 0.5)
+  dea %>% 
+  ggplot(aes(log(avg_expr + 1), avg_logFC, color = is_significant)) +
+    geom_point() +
+    geom_smooth(method = "loess", color = "darkblue") +
+    geom_hline(yintercept = 0, color = "black", linetype = "dashed") +
+    geom_text_repel(data = subset_sig, aes(label = gene), color = "black") +
+    scale_color_manual(values = c("gray78", "green4"), labels = c("sig", "no sig")) +
+    labs(title = donor, x = "log (Average Expression)", y = "log (biased / unbiased)", color = "") +
+    theme_classic2() +
+    theme(axis.title = element_text(size = 11),
+          legend.text = element_text(size = 11),
+          plot.title = element_text(hjust = 0.5, face = "bold"))
+
+})
+ma_plot_list
+```
+
+Of note, we observe a very strong upregulation of FTH1 in all cell types. This gene encodes the heavy subunit of ferritin, whose function is to maintain intracellular iron balance. This function is particularly important in oxidative stress conditions (likely present in our study), as an excess of iron can increases the formation of [reactive oxygen species](https://www.nature.com/articles/1208901) (ROS). Thus, the time-dependent upregulation of FTH1 observed until 24h can serve as a protective mechanism against such stress. Moreover, in most cell types we also observe the upregulation of Cold Inducible RNA Binding Protein (CIRBP) and of Hypoxia Inducible Factor 1 Subunit Alpha (HIF1A), which are the master regulators of the [response to cold-shock](https://www.sciencedirect.com/science/article/pii/S0304419X09000730?via%3Dihub) and [hypoxia](https://www.nature.com/articles/emm20041.pdf?origin=ppub), respectively:
+
+```{r}
+cirbp_df %>% 
+  ggplot(aes(time, cirbp_expr, fill = time)) +
+    geom_boxplot() +
+    labs(x = "", y = "CIRBP expression") +
+    theme_classic() +
+    theme(legend.position = "none")
+```
+
+Thus, this is consistent with the fact that we are taking cells out of its physiological niche (~37ºC) and placing them at RT (~20ºC). Furthermore:
+
+```{r}
+pbmc$is_biased <- ifelse(pbmc$time %in% c("0h", "2h"), "unbiased", "biased")
+pbmc@meta.data %>% 
+  mutate(is_biased = factor(is_biased, levels = c("unbiased", "biased"))) %>% 
+  ggplot(aes(is_biased, nFeature_RNA, fill = is_biased)) +
+    geom_boxplot() +
+    labs(x = "", y = "# Detected Genes") +
+    theme_classic() +
+    theme(legend.position = "none")
+```
+
+In the biased samples there is an increased dropout rate and a decreased number of detected genes. This can be attributed to a lowered rate of transcription given the cold shock.
+
+# Cell type specificity
+
+```{r}
+deg_100 <- purrr::map(dea_list, ~.x$gene[1:100])
+deg_100 <- deg_100[levels(pbmc$cell_type)]
+names(deg_100) <- c("T-cell", "NK", "Monocyte", "B-cell")
+all_genes <- Reduce(union, deg_100)
+cell_types <- names(deg_100)
+matr_meta <- matrix(, nrow = length(all_genes), ncol = length(cell_types))
+for (i  in 1:length(all_genes)) {
+  new_row <- as.numeric(map_dbl(deg_100, ~ all_genes[i] %in% .))
+  matr_meta[i, ] <- new_row
+}
+rownames(matr_meta) <- all_genes
+colnames(matr_meta) <- names(deg_100)
+matr_meta <- matr_meta[order(rowSums(matr_meta), decreasing = TRUE), ]
+cols <- colorRampPalette(c("gray99", "blue4"))(2)
+heatmap_metasignatures <- pheatmap(
+  matr_meta, 
+  color = cols, 
+  cluster_rows = FALSE, 
+  cluster_cols = FALSE, 
+  fontsize = 5,
+  gaps_col = 1:4,
+  legend = FALSE,
+  show_rownames = FALSE, 
+  show_colnames = TRUE,
+  fontsize_col = 12,
+  angle_col = 45
+)
+saveRDS(object = heatmap_metasignatures, file = "results/R_objects/ggplots/heatmap_deg_pbmc.rds")
+saveRDS(object = deg_100, file = "results/R_objects/deg_100_pbmc.rds")
+```
+
+Let us visualize the differential expression for the markers we used to annotate each cell_type:
+
+```{r}
+selected_markers <- c("IL7R", "GNLY", "LYZ", "MS4A1")
+pbmc_types <- pbmc_types[c("T", "NK", "Monocyte", "B")]
+ridge_df <- purrr::map2(pbmc_types, selected_markers, function(seurat, marker) {
+  df <- data.frame(
+    time = factor(seurat$time, levels = rev(levels(seurat$time))),
+    is_biased = factor(seurat$is_biased, levels = c("unbiased", "biased")),
+    marker_expression = seurat[["RNA"]]@data[marker, ]
+  )
+  df
+})
+new_names <- c("IL7R (T-cell)", "GNLY (NK)", "LYZ (Monocyte)", "MS4A1 (B-cell)")
+names(ridge_df) <- new_names
+ridge_df <- bind_rows(ridge_df, .id = "id")
+ridge_df$id <- factor(ridge_df$id, levels = new_names)
+ridge_gg <- ggplot(ridge_df, aes(marker_expression, time, fill = is_biased)) +
+  geom_density_ridges() +
+  facet_grid(. ~ id) +
+  # scale_x_continuous(limits = c(-0.5, 3)) +
+  scale_fill_manual(values = c("azure3", "firebrick2")) +
+  labs(x = "Normalized Expression", y = "", fill = "") +
+  theme_classic() 
+ridge_gg
+saveRDS(ridge_gg, file = "results/R_objects/ggplots/ridge_plot_markers.rds")
+```
+
+EXPLORATORY: cell-type signatures:
+
+```{r}
+# Score with cell type-specific markers
+pbmc0 <- subset(pbmc, subset = time == "0h")
+Idents(pbmc0) <- "cell_type"
+markers <- FindAllMarkers(pbmc0, test.use = "wilcox")
+markers$male[markers$male$cluster == "2", ]
+t_cell_mark <- c("CD3D", "IL7R", "LTB", "CD3E", "FCER1G", "TYROBP")
+nk_mark <- c("GNLY", "NKG7", "GZMB", "FGFBP2", "CST7", "KLRF1", "GZMA", "CTSW", "CCL4", "SPON2", "PSMA1")
+monocyte_mark <- c("S100A9", "LYZ", "S100A8", "CST3")
+b_mark <- c("IGLL5", "CD79A", "MS4A1", "TCL1A", "CD79B", "HLA-DQA1", "LINC00926", "FCER2", "BANK1", 
+            "VPREB3", "CD19", "BLK", "CD22", "IGJ", "TLR10", "BLNK")
+markers_list <- list(t_cell = t_cell_mark, nk = nk_mark, monocyte = monocyte_mark, b = b_mark)
+pbmc_types <- purrr::map(pbmc_types, function(seurat) {
+  seurat <- AddModuleScore(
+    seurat, 
+    features = markers_list, 
+    name = c("t_score", "nk_score", "monocyte_score", "b_score")
+  )
+  seurat
+})
+
+# 
+selected_scores <- c("t_score1", "nk_score2", "monocyte_score3", "b_score4")
+pbmc_types <- pbmc_types[c("T", "NK", "Monocyte", "B")]
+ridge_df <- purrr::map2(pbmc_types, selected_scores, function(seurat, score) {
+  df <- data.frame(
+    time = factor(seurat$time, levels = rev(levels(seurat$time))),
+    is_biased = factor(seurat$is_biased, levels = c("unbiased", "biased")),
+    cell_type_score = seurat@meta.data[, score]
+  )
+  df
+})
+new_names <- c("T-cell", "NK", "Monocyte", "B-cell")
+names(ridge_df) <- new_names
+ridge_gg_l <- purrr::map2(ridge_df, names(ridge_df), function(df, title) {
+  p <- ggplot(df, aes(cell_type_score, time, fill = is_biased)) +
+    geom_density_ridges() +
+    scale_fill_manual(values = c("azure3", "firebrick2")) +
+    labs(title = title, x = "Cell type score", y = "", fill = "") +
+    theme_classic() +
+    theme(plot.title = element_text(hjust = 0.5, size = 12))
+  p
+})
+ridge_gg_l$`T-cell` <- ridge_gg_l$`T-cell` +
+  scale_x_continuous(breaks = c(-1, 0, 1)) +
+  theme(axis.text.y = element_text(size = 11),
+        axis.title.x = element_blank(),
+        plot.margin = unit(c(0.3,0,0.25,0), units = "cm"))
+ridge_gg_l$NK <- ridge_gg_l$NK + 
+  theme(axis.line.y = element_blank(), 
+        axis.text.y = element_blank(), 
+        axis.ticks.y = element_blank(),
+        axis.title.x = element_blank(),
+        plot.margin = unit(c(0.3,0,0.25,0), units = "cm"))
+ridge_gg_l$Monocyte <- ridge_gg_l$Monocyte + 
+  theme(axis.line.y = element_blank(), 
+        axis.text.y = element_blank(), 
+        axis.ticks.y = element_blank(),
+        axis.title.x = element_blank(),
+        plot.margin = unit(c(0.3,0,0.25,0), units = "cm"))
+ridge_gg_l$`B-cell` <- ridge_gg_l$`B-cell` + 
+  theme(axis.line.y = element_blank(), 
+        axis.text.y = element_blank(), 
+        axis.ticks.y = element_blank(),
+        axis.title.x = element_blank(),
+        plot.margin = unit(c(0.3,0,0.25,0), units = "cm"))
+leg <- as_ggplot(get_legend(ridge_gg_l$`B-cell` + theme(legend.position = "bottom")))
+ggsave(
+  filename = "../doc/figures/legends/ridge_plot_legend.pdf", 
+  plot = leg, 
+  width = 9, 
+  height = 5,
+  units = "cm"
+)
+ridge_gg_arr <- ggarrange(plotlist = ridge_gg_l, nrow = 1, ncol = 4, legend = "none", widths = c(1,0.8,0.8,0.8,0.8))
+ridge_gg_arr
+saveRDS(ridge_gg_arr, "results/R_objects/ggplots/ridge_plot_scores.rds")
+```
+
+As we can see, the 100 differentially expressed genes (DEG) are largely PBMC-type specific. Let us assess the identity of those common in all cell types:
+
+```{r}
+times <- c("0h", "8h", "24h", "48h")
+genes <- Reduce(intersect, metasignatures)
+sce_meta <- sce_10x[genes, order(sce_10x$label)]
+seurat_meta <- Convert(sce_meta, to = "seurat")
+seurat_meta <- ScaleData(seurat_meta, vars.to.regress = "batch")
+expr_matr <- as.matrix(seurat_meta@scale.data)
+meta_df <- data.frame(
+  time = c(), 
+  gene = c(),
+  expression = c(), 
+  fraction_expr = c()
+)
+
+for (t in times) {
+  for (g in genes) {
+    expr <- mean(expr_matr[g, colnames(sce_meta[, sce_meta$time == t])])
+    frc_expr <- mean(counts(sce_meta[g, sce_meta$time == t]) != 0) 
+    current_df <- data.frame(
+      gene = g, 
+      time = t, 
+      expression = expr, 
+      fraction_expr = frc_expr
+    )
+    meta_df <- rbind(meta_df, current_df)
+  }
+}
+dot_plot_metasignatures <- meta_df %>% 
+  ggplot(aes(x = time, y = gene, color = expression)) +
+    geom_point(size = 3) +
+    scale_colour_gradientn(colours = c("blue","white","red")) +
+    labs(x = "", y = "") +
+    theme_classic() +
+    theme(axis.text = element_text(size = 13), 
+          legend.text = element_text(size = 13), 
+          legend.title = element_text(size = 13), 
+          legend.position = "bottom", 
+          legend.box = "vertical")
+dot_plot_metasignatures
+ggsave(
+  filename = str_c("results/plots/", date, "_dot_plot_metasignatures.pdf"),
+  plot = dot_plot_metasignatures, 
+  width = 3, 
+  height = 8
+)
+saveRDS(object = dot_plot_metasignatures, file = "results/R_objects/dot_plot_metasignatures.rds")
+```
+
+# Gene Ontology Enrichment
+
+All cell types: 
+
+```{r}
+top_list <- list(
+  down = dea_general$gene[dea_general$avg_logFC < 0], 
+  up = dea_general$gene[dea_general$avg_logFC > 0], 
+  universe = rownames(pbmc)
+)
+top_entrez <- map(top_list, function(x) {
+  entrez <- AnnotationDbi::select(
+    x = org.Hs.eg.db, 
+    keys = x, 
+    keytype = "SYMBOL",
+    columns = "ENTREZID"
+  )$ENTREZID
+  entrez <- entrez[!is.na(entrez)]
+  entrez
+})
+top_go <- map(
+  top_entrez[c("down", "up")], 
+  get_GOenrichment, 
+  universe = top_entrez$universe
+)
+top_go <- map(top_go, function(go) {
+  selection <- go$Size >= 3 & go$Size <= 300 & go$Count >= 5 & go$OddsRatio > 2 & go$Pvalue < 0.05
+  go <- go[selection, ]
+  go[order(go$OddsRatio, decreasing = TRUE), ]
+})
+top_go <- top_go %>% 
+  map(~ .x[1:2, ]) %>% 
+  bind_rows(.id = "direction")
+top_go_gg <- top_go %>% 
+  mutate(direction = factor(direction, levels = c("up", "down")),
+         Term = factor(Term, levels = rev(top_go$Term))) %>% 
+  ggplot(aes(Term, -1 * log10(Pvalue), color = direction)) +
+    geom_segment(aes(x = Term, xend = Term, y = 0, yend = -1 * log10(Pvalue))) +
+    geom_point() +
+    scale_color_manual("", values = c("firebrick3", "dodgerblue3")) +
+    labs(x = "", y = "-log10 (p-value)", color = "") +
+    theme_light() +
+    coord_flip()
+saveRDS(object = top_go_gg, "results/R_objects/ggplots/lollipop_go_enrichment_pbmc.rds")
+```
+
+Cell type-specific:
+
+```{r}
+# Down-regulated
+deg_down <-purrr::map(dea_list, function(df) {
+  df <- df[df$avg_logFC < 0, ]
+  df$gene[1:200]
+})
+deg_down_entrez <- map(deg_down, function(x) {
+  entrez <- AnnotationDbi::select(
+    x = org.Hs.eg.db, 
+    keys = x, 
+    keytype = "SYMBOL",
+    columns = "ENTREZID"
+  )$ENTREZID
+  entrez <- entrez[!is.na(entrez)]
+  entrez
+})
+universe_entrez <- AnnotationDbi::select(
+    x = org.Hs.eg.db, 
+    keys = rownames(pbmc), 
+    keytype = "SYMBOL",
+    columns = "ENTREZID"
+  )$ENTREZID
+go_down <- purrr::map(
+  deg_down_entrez, 
+  get_GOenrichment, 
+  universe = universe_entrez
+)
+go_down_filt <- purrr::map(go_down, function(go) {
+  selection <- go$Size >= 3 & go$Size <= 300 & go$Count >= 5 & go$OddsRatio > 2 & go$Pvalue < 0.05
+  go <- go[selection, ]
+  go[order(go$OddsRatio, decreasing = TRUE), ]
+})
+purrr::map(go_down_filt, head)
+
+# Plot
+go_terms <- c("GO:0038093", "GO:0035722", "GO:0031343", "GO:0050853")
+go_down_df <- purrr::map2(go_terms, go_down_filt, function(term, df) {
+  df[df$GOBPID == term, c("GOBPID", "Pvalue", "Term")]
+})
+names(go_down_df) <- c("Monocyte", "T-cell", "NK", "B-cell")
+cell_types_sorted <- c("T-cell", "NK", "Monocyte", "B-cell")
+go_down_df <- go_down_df[cell_types_sorted]
+go_down_df <- bind_rows(go_down_df, .id = "cell_type")
+go_down_df$cell_type <- factor(go_down_df$cell_type, levels = cell_types_sorted)
+go_terms_sorted <- c(
+  "interleukin-12-mediated signaling pathway", 
+  "positive regulation of cell killing", 
+  "Fc receptor signaling pathway", 
+  "B cell receptor signaling pathway"
+)
+go_down_df$Term <- factor(go_down_df$Term, levels = rev(go_terms_sorted))
+palette2 <- c("#c20a35", "#aa2edc", "#71bdd0", "#bbaa2a")
+go_gg <- ggplot(go_down_df, aes(Term, -1 * log10(Pvalue), color = cell_type)) +
+  geom_segment(aes(x = Term, xend = Term, y = 0, yend = -1 * log10(Pvalue))) +
+  geom_point() +
+  scale_color_manual(values = palette2) +
+  labs(x = "", y = "-log10 (p-value)", color = "") +
+  theme_light() +
+  coord_flip()
+go_gg
+saveRDS(go_gg, "results/R_objects/ggplots/lollipop_go_enrichment_by_celltype_pbmc.rds")
+```
+
+
+# Session Information
+```{r}
+sessionInfo()
+```
+
+
+
+
+
+
+
+
+
+

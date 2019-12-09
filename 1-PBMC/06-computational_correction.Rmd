@@ -1,0 +1,278 @@
+---
+title: "Computational Correction Cold Shock"
+author: "Ramon Massoni-Badosa"
+date: "10/21/2019"
+output: 
+  BiocStyle::html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, out.width = "100%", fig.align='center', 
+                      message=FALSE, warning = FALSE)
+options(width = 1200)
+```
+
+# Introduction
+
+The objective of this notebook is to correct the cold-shock-biased transcriptomes of the PBMC is our dataset using the signature we obtained from the CLL diseased donors. Thus, the PBMC will serve as test set to elucidate the usability of this correction with real data. We will aim to remove the technical variability while preserving the biological
+
+# Pre-processing
+
+## Package loading
+
+```{r}
+library(scater)
+library(scran)
+library(Seurat)
+library(ggpubr)
+library(biomaRt)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(GOplot)
+library(GOstats)
+library(kBET)
+library(topGO)
+library(ggrepel)
+library(viridis)
+library(DescTools)
+library(pheatmap)
+library(tidyverse)
+```
+
+## Source script with functions
+
+```{r}
+source("bin/utils.R")
+```
+
+## Load data
+We dispose of a demultiplexed, filtered, normalized and annotated Seurat object that contains the transcriptome and metadata  of >10,000 Peripheral Blood Mononuclear Cells (PBMC) from two donors (male/female) that were kept at varying times at RT (0h, 2h, 8h, 24h, 48h).
+
+```{r}
+pbmc <- readRDS("results/R_objects/10X_pbmc_Seurat_clustered.RDS")
+pbmc <- subset(pbmc, subset = condition %in% c("0h", "2h", "8h", "24h_RT", "48h_RT"))
+pbmc$time <- factor(pbmc$condition, levels = c("0h", "2h", "8h", "24h_RT", "48h_RT"))
+levels(pbmc$time) <-  c("0h", "2h", "8h", "24h", "48h")
+Idents(pbmc) <- "cell_type"
+DimPlot(pbmc)
+```
+
+# Cold-shock score
+We will divide the PBMC dataset in training set (male) and test set (female). First, let us find the signature in the training set:
+
+```{r}
+pbmc$is_biased <- ifelse(pbmc$time %in% c("0h", "2h"), "unbiased", "biased")
+pbmc_donor <- SplitObject(pbmc, split.by = "donor")
+Idents(pbmc_donor$male) <- "is_biased"
+dea <- FindMarkers(pbmc_donor$male, ident.1 = "biased")
+cold_shock_signature <- rownames(dea)[1:150]
+head(cold_shock_signature)
+```
+
+With the signature, we can compute a cold-shock score for every cell in the test set:
+
+```{r}
+pbmc_donor <- map(pbmc_donor, pre_process_seurat)
+pbmc_donor <- map(pbmc_donor, RunTSNE, reduction = "pca", dims = 1:15)
+Idents(pbmc_donor$female) <- "time"
+palette <- c("#999999", "#92e8df", "#632c63", "#e4624e", "#c0e212")
+original_umap <- DimPlot(
+  pbmc_donor$female, 
+  reduction = "umap", 
+  cols = palette
+)
+original_umap
+original_tsne <- DimPlot(
+  pbmc_donor$female, 
+  reduction = "tsne", 
+  cols = palette
+)
+pbmc_donor <- map(
+  pbmc_donor, 
+  AddModuleScore, 
+  features = list(cold_shock_signature), 
+  name = "cold_shock_score"
+)
+pbmc_donor <- purrr::map(pbmc_donor, function(seurat) {
+  seurat$cold_shock_score1 <- -1 * seurat$cold_shock_score1  
+  seurat
+})
+
+vln_cold_score <- VlnPlot(
+  pbmc_donor$female, 
+  features = "cold_shock_score1", 
+  cols = c("#999999", "#92e8df", "#632c63", "#e4624e", "#c0e212"),
+  group.by = "time",
+  pt.size = 0
+)
+vln_cold_score <- vln_cold_score +
+  labs(title = "", x = "", y = "Cold-Shock Score") +
+  theme(axis.text.x = element_text(angle = 0)) +
+  theme(legend.position = "none")
+vln_cold_score
+saveRDS(vln_cold_score, "results/R_objects/ggplots/violin_cold_shock_score.rds")
+```
+
+# Predict biased cells
+
+```{r}
+# Fit logistic regression model
+set.seed(123)
+random_genes <- sample(rownames(pbmc), size = length(cold_shock_signature), replace = FALSE)
+pbmc_donor <- map(pbmc_donor, AddModuleScore, features = list(random_genes), name = "random_score")
+train_df <- data.frame(
+  cold_shock_score = pbmc_donor$male$cold_shock_score1,
+  random_score = pbmc_donor$male$random_score1,
+  class = factor(ifelse(pbmc_donor$male$is_biased == "biased", 1, 0))
+)
+logistic_fit <- glm(class ~ cold_shock_score, train_df, family = "binomial")
+summary(logistic_fit)
+logistic_random <- glm(class ~ random_score, train_df, family = "binomial")
+summary(logistic_random)
+
+# Predict probabilities on test set
+test_df <- data.frame(
+  cold_shock_score = pbmc_donor$female$cold_shock_score1,
+  random_score = pbmc_donor$female$random_score1,
+  class = factor(ifelse(pbmc_donor$female$is_biased == "biased", 1, 0))
+)
+
+test_df$probabilities_cold <- predict(logistic_fit, newdata = test_df, type = "response")
+test_df$probabilities_random <- predict(logistic_random, newdata = test_df, type = "response")
+plot(probabilities_cold ~ cold_shock_score, data = test_df)
+
+# Plot ROC curve
+thresholds <- seq(from = 0, to = 1, by = 0.01)
+positives_ind <- which(test_df$class == 1)
+negatives_ind <- which(test_df$class == 0)
+accuracies_l <- map(c("probabilities_cold", "probabilities_random"), function(x) {
+  l <- map(thresholds, function(thresh) {
+    pred <- ifelse(test_df[[x]] > thresh, 1, 0)
+    tpr <- mean(pred[positives_ind] == 1)
+    fpr <- 1 - mean(pred[negatives_ind] == 0)
+    list(tpr = tpr, fpr = fpr)
+  })
+  l
+})
+names(accuracies_l) <- c("cold_shock_score", "random_score")
+accuracies_l <- map(accuracies_l, function(l) {
+  tpr_dbl <- map_dbl(l, "tpr")
+  fpr_dbl <- map_dbl(l, "fpr")
+  roc_df <- data.frame(TPR = tpr_dbl, FPR = fpr_dbl)
+  roc_df
+})
+accuracies_df <- bind_rows(accuracies_l, .id = "score")
+roc_gg <- ggplot(accuracies_df, aes(FPR, TPR, color = score)) +
+  geom_line() +
+  labs(x = "False Positive Rate (FPR)", y = "True Positive Rate (TPR)", color = "") +
+  scale_color_manual(values = c("limegreen", "darkgray"), labels = c("cold-shock", "random")) +
+  theme_classic()
+roc_gg
+auroc <- map_dbl(c("cold_shock_score", "random_score"), function(x) {
+  df <- accuracies_df[accuracies_df$score == x, ]
+  AUC(x = df$FPR, y = df$TPR, method = "spline")
+})
+names(auroc) <- c("cold_shock_score", "random_score")
+auroc
+saveRDS(roc_gg, file = "results/R_objects/ggplots/roc_curve_pbmc.rds")
+```
+
+# Regress Out
+Now, let us regress the expression of each gene on cold shock score. We will do this for each cell type separately to minimize [Simpson's paradox](https://ds.czbiohub.org/blog/Regression-Hazards/). Then, we will keep the residuals as the variability not explained by time:
+
+```{r}
+seu <- pbmc_donor$female
+Idents(seu) <- "cell_type"
+cell_types <- c("T", "Monocyte", "NK", "B")
+mat_l <- purrr::map(cell_types, function(type) {
+  print(type)
+  seurat <- subset(seu, idents = type)
+  mat <- as.matrix(seurat[["RNA"]]@data[VariableFeatures(seurat), ])
+  lm_l <- apply(mat, 1, function(x) lm(x ~ seurat$cold_shock_score1))
+  names(lm_l) <- VariableFeatures(seurat)
+  residuals_list <- purrr::map(lm_l, "residuals")
+  residuals_mat <- Reduce(rbind, residuals_list)
+  rownames(residuals_mat) <- names(lm_l)
+  colnames(residuals_mat) <- colnames(seurat)
+  mean_expr <- rowMeans(mat)
+  residuals_mat <- residuals_mat + mean_expr
+  residuals_mat_sc <- scale(residuals_mat, center = TRUE, scale = TRUE)
+  residuals_mat_sc <- residuals_mat_sc[rownames(seurat[["RNA"]]@scale.data), ]
+})
+names(mat_l) <- cell_types
+
+# Join matrices and process
+pbmc_female2 <- pbmc_donor$female
+mat_all <- Reduce(cbind, mat_l)
+mat_all <- mat_all[rownames(seu[["RNA"]]@scale.data), colnames(seu)]
+pbmc_female2[["RNA"]]@scale.data <- mat_all
+pbmc_female2 <- RunPCA(pbmc_female2)
+pbmc_female2 <- RunUMAP(pbmc_female2, reduction = "pca", dims = 1:20)
+pbmc_female2 <- RunTSNE(pbmc_female2, reduction = "pca", dims = 1:20)
+Idents(pbmc_female2) <- "time"
+umap_corrected <- DimPlot(pbmc_female2, reduction = "umap", cols = palette)
+tsne_corrected <- DimPlot(pbmc_female2, reduction = "tsne", cols = palette)
+ggarrange(plotlist = list(original_umap, umap_corrected), ncol = 2)
+saveRDS(
+  list(original = original_umap, corrected = umap_corrected), 
+  "results/R_objects/ggplots/umaps_original_correction_pbmc.rds"
+)
+saveRDS(
+  list(original = original_tsne, corrected = tsne_corrected), 
+  "results/R_objects/ggplots/tsnes_original_correction_pbmc.rds"
+)
+```
+
+# kBET
+To quantify the mixability between time-points, we will use the metric [kBET](https://www.nature.com/articles/s41592-018-0254-1). Intuitively, kBET quantifies as well-mixed those datasets for which most subsets of neareast neighbors have the same local batch distribution as the global of the dataset. The documentation of the package can be found [here](https://github.com/theislab/kBET).
+
+```{r}
+# Calculate rejection rates
+pbmc_female <- pbmc_donor$female
+times <- c("2h", "8h", "24h", "48h")
+acceptance_rates <- purrr::map(list(pbmc_female, pbmc_female2), function(seurat) {
+  Idents(seurat) <- "time"
+  acceptance_rate_dbl <- purrr::map_dbl(times, function(t) {
+    seurat_sub <- subset(seurat, idents = c("0h", t))
+    seurat_sub$is_biased <- ifelse(seurat_sub$time == "0h", FALSE, TRUE)
+    mat <- as.matrix(seurat_sub@reductions$umap@cell.embeddings)
+    batch <- seurat_sub$is_biased
+    batch_estimate <- kBET(mat, batch = batch, verbose = TRUE, heuristic = FALSE, testSize = 50)
+    batch_results <- batch_estimate$results
+    batch_results <- batch_results %>% 
+      mutate(cell_type = seurat_sub$cell_type,
+             time = seurat_sub$time) %>% 
+      filter(tested == 1) %>% 
+      summarise(acceptance_rate = mean(kBET.pvalue.test > 0.05) * 100)
+    batch_results$acceptance_rate
+  })
+  data.frame(time = times, acceptance_rate = acceptance_rate_dbl)
+})
+names(acceptance_rates) <- c("original", "corrected")
+acceptance_rates <- bind_rows(acceptance_rates, .id = "is_corrected")
+acceptance_rates_gg <- acceptance_rates %>% 
+  mutate(time = factor(time, levels = c("0h", "2h", "8h", "24h", "48h")),
+         is_corrected = factor(is_corrected, levels = c("original", "corrected"))) %>% 
+  ggplot(aes(time, acceptance_rate, fill = is_corrected)) +
+    geom_col(position = "dodge") +
+    scale_y_continuous(limits = c(0, 100)) +
+    scale_fill_manual(values = c("azure3", "chartreuse2")) +
+    labs(x = "", y = "kBET (acceptance rate)", fill = "") +
+    theme_classic() +
+    theme(axis.text = element_text(size = 11), 
+          axis.title.y = element_text(size = 13), 
+          legend.text = element_text(size = 11))
+acceptance_rates_gg
+saveRDS(acceptance_rates_gg, "results/R_objects/ggplots/barplot_acceptance_rate_correction_pbmc.rds")
+```
+
+
+# Session Information
+
+```{r}
+sessionInfo()
+```
+

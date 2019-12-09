@@ -1,0 +1,135 @@
+---
+title: "Computational Correction Cold-Shock Signature"
+author: "Ramon Massoni-Badosa"
+date: "10/4/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+The objective of this notebook is to correct the cold-shock transcriptional signature from the CLL scRNA-seq dataset to correct for the technical artifact introduced by sampling time while presarving the biological variation.
+
+```{r}
+# Load packages
+library(scater)
+library(scran)
+library(Seurat)
+library(ggpubr)
+library(biomaRt)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(GOplot)
+library(GOstats)
+library(topGO)
+library(ggrepel)
+library(viridis)
+library(pheatmap)
+library(tidyverse)
+
+# Source script with functions
+source("bin/utils.R")
+
+# Load data
+cll_rt_l <- readRDS("results/R_objects/cll_rt_seurat_list.rds")
+dea_list <- readRDS("results/R_objects/dea_results_per_patient.rds")
+
+# Merge Seurat objects
+cll_merged <- merge(x = cll_rt_l$`1220`, y = cll_rt_l$`1472`, add.cell.ids = c("1220", "1472"))
+cll_merged$time <- factor(cll_merged$time, levels = c("0h", "2h", "4h", "6h", "8h", "24h"))
+Idents(cll_merged) <- "time"
+cll_merged <- pre_process_seurat(cll_merged)
+original_umap <- DimPlot(cll_merged, reduction = "umap", cols = viridis(6), pt.size = 0.75)
+original_umap
+ggsave(
+  filename = "results/plots/uncorrected_umap.pdf", 
+  plot = original_umap, 
+  width = 10, 
+  height = 9
+)
+
+# Find cold shock signature
+cold_shock_signature <- dea_list$`1892`$gene[dea_list$`1892`$avg_logFC > 0][1:200]
+
+# Compute cold shock score
+cll_merged <- AddModuleScore(cll_merged, features = list(cold_shock_signature), name = "cold_shock_score")
+umap_cold_shock_score <- FeaturePlot(cll_merged, features = "cold_shock_score1", cols = viridis(20), pt.size = 0.75)
+umap_cold_shock_score
+ggsave(
+  filename = "results/plots/umap_cold_shock_score.pdf", 
+  plot = umap_cold_shock_score, 
+  width = 10, 
+  height = 9
+)
+violin_cold_shock_score <- VlnPlot(
+  cll_merged, 
+  features = "cold_shock_score1", 
+  pt.size = 0, 
+  group.by = "time",
+  cols = viridis(6)
+)
+violin_cold_shock_score
+ggsave(
+  filename = "results/plots/violin_cold_shock_score.pdf", 
+  plot = violin_cold_shock_score, 
+  width = 10, 
+  height = 7
+)
+lmp <- function (modelobject) {
+  if (class(modelobject) != "lm") stop("Not an object of class 'lm' ")
+  f <- summary(modelobject)$fstatistic
+  p <- pf(f[1], f[2], f[3], lower.tail = FALSE)
+  attributes(p) <- NULL
+  return(p)
+}
+
+# Regress the expression of each gene on cold shock-score
+cll_merged <- FindVariableFeatures(cll_merged)
+mat <- as.matrix(cll_merged[["RNA"]]@data[VariableFeatures(cll_merged), ])
+lm_list <- apply(mat, 1, function(x) lm(x ~ cll_merged$cold_shock_score1))
+names(lm_list) <- VariableFeatures(cll_merged)
+
+# Distribution of p-values
+p_values_list <- map_dbl(lm_list, lmp)
+p_values_df <- data.frame(p_value = p_values_list)
+ggplot(p_values_df, aes(p_value)) +
+  geom_histogram(bins = 100) 
+
+# Scatter plots of key genes
+genes <- c("IGLC2", "EIF1", "CIRBP", "IGLC3")
+scatter_plots <- purrr::map(genes, function(gene) {
+  df <- data.frame(cold_shock_score = cll_merged$cold_shock_score1, expr = cll_merged[["RNA"]]@data[gene,], cluster = cll_merged$donor)
+  ggplot(df, aes(cold_shock_score, expr, color = cluster)) +
+    geom_point(alpha = 0.8) +
+    geom_smooth(method = "lm") +
+    labs(title = gene, x = "Cold Shock Score", y = "Gene Expression") +
+    theme_classic()
+})
+scatter_plots
+
+# Keep residuals as non-explained variability
+length(lm_list)
+residuals_mat <- bind_rows(purrr::map(lm_list, "residuals"), .id = "gene")
+residuals_mat <- t(as.matrix(residuals_mat[, 2:ncol(residuals_mat)]))
+colnames(residuals_mat) <- colnames(cll_merged)
+rownames(residuals_mat) <- names(lm_list)
+residuals_mat_sc <- scale(residuals_mat, center = TRUE, scale = TRUE)
+residuals_mat_sc <- residuals_mat_sc[rownames(cll_merged[["RNA"]]@scale.data), ]
+
+# Include new matrix in scale.data slot and pre-process
+cll_merged2 <- cll_merged
+cll_merged2[["RNA"]]@scale.data <- residuals_mat_sc
+cll_merged2 <- RunPCA(cll_merged2)
+cll_merged2 <- RunUMAP(cll_merged2, dims = 1:20)
+
+# Visualize correction
+Idents(cll_merged2) <- "time"
+palette <- c("#999999", "#92e8df", "yellow2", "limegreen", "#632c63", "#e4624e")
+regressed <- DimPlot(cll_merged2, reduction = "umap", cols = palette)
+original <- DimPlot(cll_merged, reduction = "umap", cols = palette)
+ggarrange(plotlist = list(original, regressed), ncol = 2)
+saveRDS(list(original = original, regressed = regressed), file = "results/R_objects/ggplots/umaps_original_corrected.rds")
+```
+

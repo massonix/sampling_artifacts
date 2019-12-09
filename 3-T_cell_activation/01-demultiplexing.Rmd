@@ -1,0 +1,135 @@
+---
+title: "Demultiplexing T cell activation"
+author: "Ramon Massoni-Badosa"
+date: "10/7/2019"
+output: 
+  BiocStyle::html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, out.width = "100%", fig.align='center', 
+                      message=FALSE, warning = FALSE)
+options(width = 1200)
+```
+
+# Introduction
+Previously, we observed that time at room temperature (RT) prior to cryopreservation is a source of technical artifacts in blood-based single-cell RNA-seq (scRNA-seq) data. In this suproject, we aim to assess if culturing PBMCs after thawing them and before sequencing can remove the cold-shock signature.
+
+# Description of the data
+To that end, we drew blood from two healthy donors (3 males and 1 female) and cryopreserved the samples after 0h (fresh), 8h or 24h at RT. Subsequently, we thawed the samples and either processed them immediately with [10X Chromium](https://www.nature.com/articles/ncomms14049) (day 0), or after 2 days of cell culture (day 2). To eliminate batch effect, detect doublets and reduce the library cost, we used the [cell hashing protocol](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-018-1603-1), in which each condition (in our case time-points) is labeled with an antibody against ubiquitous cell surface markers that is crosslinked with a sample-specific hashtag oligonucleotide (HTO), that is sequenced together with the cDNA libraries. Thus, we have the following libraries:
+
+- Day 0: multiplexed with the two donors (male/female), and the 3 time-points per donor (0, 8, 24h). Note that this will serve as another replicate of the very first experiment we did.
+- Day 1/2: same as before but after 1 (BCLLATLAS_14 experiment) or 2 (BCLLATLAS_11) days in culture. Moreover, T cells were activated with anti-CD3 antibodies.
+
+### Objective
+The objective of this notebook is to demultiplex the barcodes (cells) back to its original time-point. To achive that, we will follow [the pipeline from Seurat](https://satijalab.org/seurat/v3.0/hashing_vignette.html).
+
+# Pre-processing
+
+## Load packages
+
+```{r}
+library(scater)
+library(SingleCellExperiment)
+library(Seurat)
+library(Matrix)
+library(tidyverse)
+```
+
+# Demultiplex 
+
+```{r}
+# Load expression matrix, gene and cell metadata
+libraries <- c(
+  "BCLLATLAS_11/Tcell_activation_day0", 
+  "BCLLATLAS_11/Tcell_activation_day2", 
+  "BCLLATLAS_14/Tcell_activation_day0_rep2",
+  "BCLLATLAS_14/Tcell_activation_day1_rep2"
+)
+t_act_list <- list()
+
+for (lib in libraries) {
+  # Read the data
+  lib_path <- str_c("data/", lib, "/filtered_feature_bc_matrix/")
+  expression_matrix <- readMM(str_c(lib_path, "matrix.mtx.gz"))
+  barcodes <- read_csv(str_c(lib_path, "barcodes.tsv.gz"), col_names = FALSE)
+  colnames(barcodes) <- "barcode"
+  features <- read_tsv(str_c(lib_path, "features.tsv.gz"), col_names = FALSE)
+  colnames(features) <- c("ensembl", "symbol", "feature_type")
+  rownames(expression_matrix) <- features$symbol
+  colnames(expression_matrix) <- barcodes$barcode
+  
+  # Separate HTO and RNA matrices
+  hto_ind <- which(str_detect(features$feature_type, "Antibody Capture"))
+  rna_ind <- which(str_detect(features$feature_type, "Gene Expression"))
+  t_act_hto <- expression_matrix[hto_ind, ]
+  t_act_rna <- expression_matrix[rna_ind, ]
+  
+  # Setup Seurat object
+  t_act <- CreateSeuratObject(counts = t_act_rna)
+  
+  # Normalize RNA data with log normalization
+  t_act <- NormalizeData(t_act)
+  
+  # Find and scale variable features
+  t_act <- FindVariableFeatures(t_act, selection.method = "vst")
+  t_act <- ScaleData(t_act, features = VariableFeatures(t_act))
+  
+  # Add HTO as an independent assay
+  t_act[["HTO"]] <- CreateAssayObject(counts = t_act_hto)
+  t_act <- NormalizeData(t_act, assay = "HTO", normalization.method = "CLR")
+  
+  # Demultiplex
+  t_act <- HTODemux(t_act, assay = "HTO", positive.quantile = 0.99)
+  
+  # Append to list of Seurat objects
+  t_act_list[[lib]] <- t_act
+}
+names(t_act_list) <- str_remove(names(t_act_list), "(BCLLATLAS_11/|BCLLATLAS_14/)")
+```
+
+# Visualize 
+We can visualize the results as ridge plots or heatmaps:
+
+```{r}
+ridge_l <- map(t_act_list, function(t_act) {
+  Idents(t_act) <- "HTO_maxID"
+  RidgePlot(t_act, assay = "HTO", features = rownames(t_act[["HTO"]])[1:6], ncol = 3)
+})
+
+heatmap_l <- map(t_act_list, function(t_act) {
+  HTOHeatmap(t_act, assay = "HTO", ncells = 5000)
+})
+
+# Save
+walk2(ridge_l, names(ridge_l), function(ridge, lib) {
+  ggsave(
+    filename = str_c("results/plots/", lib, "_hashtag_demux_ridge.pdf"),
+    plot = ridge, height = 9, 
+    width = 16
+  )
+})
+walk2(heatmap_l, names(heatmap_l), function(heat, lib) {
+  pdf(file = str_c("results/plots/", lib, "_hashtag_demux_heatmap.pdf"), height = 4, width = 7)
+  print(heat)
+  dev.off()
+})
+ridge_l
+heatmap_l
+```
+
+# Save Seurat objects
+
+```{r}
+saveRDS(t_act_list, "results/R_objects/t_act_Seurat_list_demultiplexed.rds")
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
+

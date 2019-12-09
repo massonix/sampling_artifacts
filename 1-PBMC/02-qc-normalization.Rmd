@@ -1,0 +1,549 @@
+---
+title: "Quality Control and Normalization"
+author: "Ramon Massoni-Badosa"
+date: "2019/04/08"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, out.width = "100%", fig.align='center', 
+                      message=FALSE, warning = FALSE)
+options(width = 1200)
+```
+
+# Introduction
+
+In this notebook, we will filter and normalize the cells in the `SingleCellExperiment` (SCE) object obtained from the "1-demultiplex.Rmd" notebook. Hence, we aim to obtain a ready-to-analyze SCE object that does not contain poor-quality cells (i.e. broken or stressed cells) and with its counts normalized to correct for technical artifacts.
+
+## Package loading
+
+```{r}
+library(scater)
+library(SC3)
+library(Seurat)
+library(ggpubr)
+library(purrr)
+library(DoubletFinder)
+library(scran)
+library(tidyverse)
+```            
+
+## Source script with function definitions
+
+```{r}
+source("bin/utils.R")
+```
+
+# Cell QC
+
+## Calculate QC metrics
+
+To calculate the cell quality control metrics, we will use the `calculateQCMetrics` function from the `scater` package, which computes a series of QC metrics for each cell (such as library size or number of detected genes), and stores them as new variables in the column metadata of the `SingleCellExperiment` object (colData). We start by loading the demultiplexed SingleCellExperiment object:
+
+```{r}
+date <- Sys.Date()
+
+# Load demultiplexed SingleCellExperiment object
+sce <- readRDS("results/R_objects/SCE_demultiplexed.RDS")
+
+# Filter out unassigned cells
+sce <- sce[, sce$condition != "unassigned"]
+
+# Define mitochondrial genes as internal controls
+mt_symb <- str_subset(rowData(sce)$name, "^MT-")
+mt_ensembl <- rowData(sce)[rowData(sce)$name %in% mt_symb, "id"]
+isSpike(sce, "MT") <- rownames(sce) %in% mt_ensembl
+
+# Calculate QC metrics
+sce <- calculateQCMetrics(
+  sce,
+  feature_controls = list(MT = isSpike(sce, "MT"))
+)
+sce
+head(colnames(colData(sce)), 10)
+```
+
+### Library size
+We first filter out cells that have a library size (total number of RNA molecules) too small in comparison with other cells. Such cells are likely to have broken or failed to capture. To determine the threshold, we can visualize the library size distribution with a histogram. As there are outliers with a great deal of counts, we will plot the log distribution:
+
+```{r}
+x_titl <- expression("log"[10]*"(library size)")
+lib_size_qc <- as.data.frame(colData(sce)) %>% 
+  mutate(exclude = ifelse(log10(total_counts) < 2.85 | log10(total_counts) > log10(9000), TRUE, FALSE)) %>% 
+  ggplot(aes(log10(total_counts), fill = exclude, color = exclude)) + 
+    geom_histogram(bins = 100, alpha = 0.65) +
+    geom_vline(xintercept = 2.85, color = "red", linetype = "dashed") +
+    geom_vline(xintercept = log10(9000), color = "red", linetype = "dashed") +
+    scale_x_continuous(x_titl) +
+    scale_y_continuous(expand = c(0,0)) +
+    scale_color_manual(values = c("black", "red2")) + 
+    scale_fill_manual(values = c("black", "red2")) +
+    theme_bw() +
+    theme(plot.title = element_text(hjust = 0.5))
+
+lib_size_qc
+```
+
+Based on the log distribution, we remove those cells with a library size lower than 10^2.85 = 707 UMI. These cells are likely cellular debris present in empty droplets. Moreover, we also filter cells with > 10,000 UMI, which are likely doublets. Notice that we are using data-driven filters which are based on the comparison between cells:
+
+```{r}
+table(sce$total_counts > 707 & sce$total_counts < 9000)
+keep_lib_size <- sce$total_counts > 707 & sce$total_counts < 9000
+```
+
+### Cell coverage
+We next filter by the cell coverage, which is the number of detected genes in each cell (i.e., number of genes with non-zero counts for a given cell). We want to ensure that the reads are distributed across the transcriptome. Thus, we rule out those cells that have an abnormally low number of detected genes.
+
+```{r}
+cell_coverage_hist <- as.data.frame(colData(sce)) %>% 
+  mutate(exclude = ifelse(total_features_by_counts < 350 | total_features_by_counts > 2000, TRUE, FALSE)) %>%
+  ggplot(aes(total_features_by_counts, fill = exclude, color = exclude)) + 
+    geom_histogram(bins = 100, alpha = 0.65) +
+    geom_vline(xintercept = 350, color = "red", linetype = "dashed") +
+    geom_vline(xintercept = 2000, color = "red", linetype = "dashed") +
+    scale_x_continuous("Number of detected genes") +
+    scale_y_continuous(expand = c(0,0)) +
+    scale_color_manual(values = c("black", "red2")) + 
+    scale_fill_manual(values = c("black", "red2")) +
+    theme_bw() +
+    theme(plot.title = element_text(hjust = 0.5))
+
+library_quality <- ifelse(sce$total_features_by_counts < 350, TRUE, FALSE)  
+sce$exclude <- library_quality
+cumul_dis <- plotScater(
+  sce, 
+  nfeatures = 300, 
+  colour_by = "exclude", 
+  exprs_values = "counts"
+)
+cumul_dis <- cumul_dis +
+  scale_color_manual(values = c("black", "red2")) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+cell_coverage_qc <- ggarrange(
+  plotlist = list(cell_coverage_hist, cumul_dis), 
+  nrow = 1, 
+  ncol = 2
+)
+cell_coverage_qc
+```
+
+According to the distribution, we remove those cells with a cell coverage lower than 350 detected genes:
+
+```{r}
+table(sce$total_features_by_counts > 350 & sce$total_features_by_counts < 2000)
+keep_cell_cov <- sce$total_features_by_counts > 350 & sce$total_features_by_counts < 2000
+```
+
+### Mitochondrial genes
+The third cell filter we aim to apply is based on the percentage of counts of mitochondrial genes. It is expected that poor-quality cells are enriched for the expression of mitochondrial genes, likely because cells underwent apoptosis:
+
+```{r}
+mt_genes_qc <- as.data.frame(colData(sce)) %>% 
+  mutate(exclude = ifelse(pct_counts_MT > 10, TRUE, FALSE)) %>%
+  ggplot(aes(pct_counts_MT, fill = exclude, color = exclude)) +
+    geom_histogram(bins = 100, alpha = 0.65) +
+    geom_vline(xintercept = 10, linetype = "dashed", color = "red") +
+    scale_x_continuous("Mitochondrial proportion (%)") +
+    scale_y_continuous(expand = c(0, 0)) +
+    scale_color_manual(values = c("black", "red2")) + 
+    scale_fill_manual(values = c("black", "red2")) +
+    theme_bw() +
+    theme(plot.title = element_text(hjust = 0.5))
+
+mt_genes_qc
+```
+
+According to the distribution, we remove those cells with a mitochondrial proportion greater than 10:
+
+```{r}
+table(sce$pct_counts_MT < 10)
+keep_mt <- sce$pct_counts_MT < 10
+```
+
+## Visual inspection low quality cells
+After establishing the threshold for 3 QC metrics: library size, cell coverage and % of mitochondrial genes, we can classify cells as high and low quality. Note that, although there are cells that are outliers in all 3 metrics, we only require a cell to be an outlier in a single metric to be considered as low-quality:
+
+```{r}
+sce$is_high_quality <- keep_lib_size & keep_cell_cov & keep_mt
+```
+
+We aim to assess visually if low-quality cells are indeed outlier cells. To that end, we can run and plot a tSNE:
+
+```{r}
+sce$exclude <- !(sce$is_high_quality)
+cell_quality_tsne <- plot_tsne(
+  sce, 
+  exprs_values = "counts", 
+  color_by = "exclude", 
+  colors = c("gray62", "red2"),
+  point_size = 1.8,
+  point_alpha = 0.75
+)
+
+# Save tSNE
+ggsave(
+  filename = str_c("results/plots/", date, "_tsne_low_quality_cells.pdf"), 
+  plot = cell_quality_tsne,
+  device = "pdf",
+  width = 9,
+  height = 8
+)
+cell_quality_tsne
+```
+
+Interestingly, the cells we classified as poor quality cluster together. There are a few cells classified as low-quality in clusters with a great deal of high-quality cells. Thus, if we applied more stringent cutoffs, we would start losing important biological information.
+
+As a final validation, it is important to analyse the QC metrics jointly. Particularly, if high mitochondrial expression is associated with a large library size, these would represent metabolically active cells, which we should keep:
+
+```{r}
+qc_titles <- c("Library Size (total UMI)", "Number of detected genes", "% mitochondrial expression")
+joint_qc_gg <- colData(sce) %>% 
+  as.data.frame() %>% 
+  ggplot(aes(total_counts, total_features_by_counts, color = pct_counts_MT)) +
+    geom_point(alpha = 0.5) +
+    geom_vline(xintercept = 707, linetype = "dashed", color = "red") +
+    geom_vline(xintercept = 10000, linetype = "dashed", color = "red") +
+    geom_hline(yintercept = 350, linetype = "dashed", color = "red") +
+    geom_hline(yintercept = 2000, linetype = "dashed", color = "red") +
+    scale_color_viridis_c() +
+    labs(x = qc_titles[1], y = qc_titles[2], color = qc_titles[3]) +
+    theme_classic()
+joint_qc_gg
+saveRDS(joint_qc_gg, file = "results/R_objects/ggplots/scatter_plot_joint_qc_pbmc.rds")
+```
+
+As we can see, the cells with the highest percentage of mitochondrial genes also have the lowest UMI.
+
+## Cell filtering
+We proceed to filter out poor-quality cells:
+
+```{r}
+table(sce$is_high_quality)
+sce <- sce[, sce$is_high_quality]
+sce
+```
+
+## Doublet Detection
+We will detect the doublets present in our dataset. We carry it out here because we will use [DoubletFinder](https://www.cell.com/cell-systems/fulltext/S2405-4712(19)30073-0?_returnURL=https%3A%2F%2Flinkinghub.elsevier.com%2Fretrieve%2Fpii%2FS2405471219300730%3Fshowall%3Dtrue), a tool that works with a fully processed Seurat object. 
+
+DoubetFinder simulates doublets by averaging the UMI of two real cells. It subsequently project the simulations and real cells in PCA space and computes a nearest neighbors graph. Doublets are identified as those cells that have a proportion of artificial neighbors (pAN) greater than what you would expect by chance.
+
+Note that different donors and temperatures were sequenced in different 10X lanes. Hence, as it is impossible to find doublets from two different sequencing libraries, we will split the object by library:
+
+```{r}
+# Convert to Seurat object
+logcounts(sce) <- log(counts(sce) + 1) #otherwise I can't convert to Seurat
+seurat <- as.Seurat(sce)
+
+# Create list of seurat objects (split by library)
+seurat$library <- str_c(seurat$donor, seurat$batch, sep = "_")
+seurat_l <- SplitObject(seurat, split.by = "library")
+
+# Preprocess independently
+seurat_l <- purrr:::map(seurat_l, function(seurat) {
+  seurat %>% 
+    NormalizeData() %>% 
+    FindVariableFeatures() %>%
+    ScaleData() %>% 
+    RunPCA() %>% 
+    RunTSNE(dims = 1:15) %>% 
+    RunUMAP(dims = 1:15)
+})
+
+# pK identification
+pk_dbl <- purrr::map_dbl(seurat_l, function(seurat) {
+  sweep_res_list <- paramSweep_v3(seurat, PCs = 1:10, sct = FALSE)
+  sweep_stats <- summarizeSweep(sweep_res_list, GT = FALSE)
+  bcmvn <- find.pK(sweep_stats)
+  pK <- as.numeric(as.character((bcmvn[which.max(bcmvn$BCmetric), "pK"])))
+  pK
+})
+
+# Run DoubletFinder
+nExps <- c(0.07, 0.05, 0.07, 0.05)
+seurat_l <- pmap(list(seurat_l, pk_dbl, nExps), function(seurat, pk, nExp_poi) {
+  nExp_poi <- round(0.08 * ncol(seurat))
+  seurat <- doubletFinder_v3(
+    seu = seurat, 
+    PCs = 1:10, 
+    pN = 0.25, 
+    pK = pk, 
+    nExp = nExp_poi, 
+    reuse.pANN = FALSE, 
+    sct = FALSE
+  )
+})
+
+# Visualize doublets
+doublets_l <- purrr::map(seurat_l, function(seurat) {
+  selection <- str_subset(colnames(seurat@meta.data), "^DF")
+  df <- seurat@meta.data[, selection, drop = FALSE]
+  colnames(df) <- "is_doublet"
+  df
+})
+doublets_l <- purrr::map(doublets_l, rownames_to_column, var = "barcode")
+doublets_df <- bind_rows(doublets_l, .id = "library")
+rownames(doublets_df) <- doublets_df$barcode
+doublets_df <- doublets_df[colnames(seurat), ]
+seurat$is_doublet <- doublets_df$is_doublet
+Idents(seurat) <- "is_doublet"
+seurat <- NormalizeData(seurat)
+seurat <- pre_process_seurat(seurat)
+doublets_umap <- DimPlot(seurat, reduction = "umap", cols = c("gray", "red"))
+doublets_umap
+saveRDS(doublets_umap, file = "results/R_objects/ggplots/umap_doublets_pbmc.rds")
+
+# Remove doublets
+symbols <- rowData(sce)$name
+seurat <- subset(seurat, idents = "Singlet")
+sce <- as.SingleCellExperiment(seurat)
+rownames(sce) <- symbols
+```
+
+# Gene QC
+
+## Gene filtering
+
+Gene filtering must be performed right after cell filtering, as some genes may be exclusively expressed in poor-quality cells. The purpose of this step is to remove lowly expressed genes that do not possess enough information for reliable statistical analysis. Furthermore, the discreteness of the counts can affect the reliability of downstream analysis. These genes contain a great deal of dropout events: transcripts that are not detected in the final dataset even though the gene is expressed in the cell.
+
+We will filter genes with a mean expression below a certain cutoff. Again, such cutoff will be data-driven, so let us start by visualizing the distribution of the mean expression:
+
+```{r}
+mean_expr_df <- data.frame(
+  gene = rownames(sce),
+  mean_expression = rowMeans(counts(sce))
+)
+x_titl <- expression("log"[10]*"(mean expression)")
+mean_expr_gg <- mean_expr_df %>% 
+  mutate(exclude = ifelse(log10(mean_expression) < -2.25, TRUE, FALSE)) %>%
+  ggplot(aes(log10(mean_expression), fill = exclude, color = exclude)) +
+    geom_histogram(bins = 100, alpha = 0.65) +
+    geom_vline(xintercept = -2.25, color = "red", linetype = "dashed") +
+    scale_x_continuous(x_titl) +
+    scale_fill_manual(values = c("black", "red2")) +
+    scale_color_manual(values = c("black", "red2")) + 
+    theme_bw() +
+    theme(plot.title = element_text(hjust = 0.5))
+
+write.table(
+  mean_expr_df, 
+  file = str_c("results/tables/", date, "_mean_gene_expression.tsv"),
+  sep = "\t", 
+  row.names = FALSE, 
+  col.names = TRUE
+)
+ggsave(
+  filename = str_c("results/plots/", date, "_mean_gene_expression.pdf"), 
+  plot = mean_expr_gg,
+  device = "pdf",
+  height = 7,
+  width = 8
+)
+mean_expr_gg
+saveRDS(mean_expr_gg, "results/R_objects/ggplots/histogram_gene_qc_pbmc.rds")
+```
+
+We see that the distribution is bimodal, with the first peak corresponding to lowly expessed genes. We want our cutoff to fall somewhere between the two peaks, so a mean expression of 10^-2.25^ = 0.0056 UMI is a good choice:
+
+```{r}
+keep_genes <- log10(mean_expr_df$mean_expression) > -2.25  
+table(keep_genes)
+sce <- sce[keep_genes, ]
+sce
+```
+
+## Identify highest expressed genes
+In addition, we want to assess which are the highest expressed genes. We expect it to be housekeeping genes, such as actin beta (ACTB).
+
+```{r}
+highest_expr_genes <- plotHighestExprs(sce, feature_names_to_plot = "name")
+highest_expr_genes
+```
+
+
+# Normalization
+We want to correct for two biases:
+
+1. Library size: if cell A has twice the library size of cell B, we expect that, on average, every gene in cell A will have twice the number of counts of cell B.
+2. RNA composition: we assume that most genes in cell A are not over-expressed in cell B. However, due to dropout events this might not be the case, so that the genes expressed in cells with low RNA composition (low cell coverage) will tend to be biased towards overexpression.
+
+We will use the `scran` package to compute size factors for the count matrix and correct for the former biases:
+
+```{r}
+sce <- computeSumFactors(sce)
+summary(sizeFactors(sce))
+sce <- normalize(sce)
+```
+
+We can see that the previous command introduced a new matrix in the “assays” layer of the SingleCellExperiment object, corresponding to the log-normalized expression matrix:
+
+```{r}
+assays(sce)
+logcounts(sce)[1:6, 1:6]
+```
+
+Interestingly, we see that the size factors correlate almost perfectly with the library size:
+
+```{r}
+plot(sizeFactors(sce) ~ sce$total_counts)
+summary(lm(sizeFactors(sce) ~ sce$total_counts))
+```
+
+Let us save all QC plots into a single figure:
+
+```{r}
+cumul_dis <- cumul_dis + 
+  ylab("Cumulative proportion \n of library")
+qc_gg_list <- list(
+  lib_size_qc, 
+  cell_coverage_hist, 
+  mt_genes_qc, 
+  cumul_dis, 
+  cell_quality_tsne, 
+  mean_expr_gg
+)
+qc_gg <- ggarrange(
+  plotlist = qc_gg_list,
+  nrow = 2, 
+  ncol = 3,
+  common.legend = TRUE,
+  labels = "auto"
+)
+ggsave(
+  plot = qc_gg, 
+  filename = str_c("results/plots/", date, "_quality_control.png"), 
+  device = "png", 
+  width = 12, 
+  height = 9
+)
+ggsave(
+  plot = qc_gg, 
+  filename = str_c("doc/figures/R/", date, "_quality_control.pdf"), 
+  device = "pdf", 
+  width = 19, 
+  height = 14.25,
+  units = "cm"
+)
+qc_gg
+```
+
+# Batch effect detection
+As we know, we have data from two different donors (male and female) and two different batches (JULIA_03 and JULIA_04). We need to assess whether that is introducing batch effects:
+
+
+```{r}
+# Find Highly Variable Genes (HVG)
+sce_var <- sce 
+fit_var <- trendVar(sce_var, use.spikes = FALSE) 
+decomp_var <- decomposeVar(sce_var, fit_var)
+top_hvgs <- order(decomp_var$bio, decreasing = TRUE)
+top_20_pct_hvgs <- top_hvgs[1:(0.2 * length(top_hvgs))]
+sce_var <- sce_var[top_20_pct_hvgs, ]
+
+# Run tSNE
+sce_var <- runTSNE(object = sce_var, exprs_values = "logcounts")
+
+# Create data frame and base plot
+tsne_df <- reducedDim(sce_var, "TSNE") %>% 
+  as.data.frame() %>% 
+  set_colnames(c("TSNE1", "TSNE2")) %>% 
+  mutate(batch = sce_var$batch, donor = sce$donor) 
+
+tsne <- ggplot(tsne_df, aes(TSNE1, TSNE2)) +
+  geom_point(size = 2) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+# Batch effect (batch&donor)
+tsne_batch <- tsne + 
+  geom_point(aes(color = batch)) +
+  scale_color_manual(values = c("#5f74a0", "#c18c69"))
+tsne_donor <- tsne + 
+  geom_point(aes(color = donor)) +
+  scale_color_manual(values = c("#a6599f", "#36c987"))
+
+tsne_batch
+tsne_donor
+```
+
+We see a clear batch effect. However as there is an overlapping between "batch" and "donor" (03-male, 04-female), we do not know which one of the two is introducing it. Let us condition one on the other and inspect what is the primary source of variability:
+
+```{r}
+# Batch conditioned on donor
+male_batch <- tsne_df %>% 
+  filter(donor == "male") %>% 
+  ggplot(aes(TSNE1, TSNE2, color = batch)) +
+    geom_point(size = 1.5) +
+    scale_color_manual(values = c("#5f74a0", "#c18c69")) +
+    ggtitle("Male") +
+    theme_bw() +
+    theme(panel.grid = element_blank(),
+          plot.title = element_text(hjust = 0.5))
+    
+female_batch <- tsne_df %>% 
+  filter(donor == "female") %>% 
+  ggplot(aes(TSNE1, TSNE2, color = batch)) +
+    geom_point(size = 1.5) +
+    scale_color_manual(values = c("#5f74a0", "#c18c69")) +
+    ggtitle("Female") +
+    theme_bw() +
+    theme(panel.grid = element_blank(), 
+          plot.title = element_text(hjust = 0.5))
+
+ggarrange(plotlist = list(male_batch, female_batch), ncol = 2, nrow = 1)
+
+# Donor conditioned on batch
+julia_03_tsne <- tsne_df %>% 
+  filter(batch == "JULIA_03") %>% 
+  ggplot(aes(TSNE1, TSNE2, color = donor)) +
+    geom_point(size = 1.5) +
+    scale_color_manual(values = c("#5f74a0", "#c18c69")) +
+    ggtitle("JULIA_03") +
+    theme_bw() +
+    theme(panel.grid = element_blank(),
+          plot.title = element_text(hjust = 0.5))
+    
+julia_04_tsne <- tsne_df %>% 
+  filter(batch == "JULIA_04") %>% 
+  ggplot(aes(TSNE1, TSNE2, color = donor)) +
+    geom_point(size = 1.5) +
+    scale_color_manual(values = c("#5f74a0", "#c18c69")) +
+    ggtitle("JULIA_04") +
+    theme_bw() +
+    theme(panel.grid = element_blank(), 
+          plot.title = element_text(hjust = 0.5))
+
+ggarrange(plotlist = list(julia_03_tsne, julia_04_tsne), ncol = 2, nrow = 1)
+```
+
+Indeed, we see how both variables introduce variability in the data. In downstream analysis, we will separate male and female and treat them as biological replicates. Furthermore, we will introduce "batch" as a covariate in the analysis. 
+
+# Save filtered and normalized SingleCellExperiment object
+
+We have our SCE filtered and normalized. We can now select the columns of interest in the colData and rowData slots, and then save the object as .RDS file to use in future analysis.
+
+```{r}
+colData(sce) <- colData(sce)[, c("batch", "donor", "condition")]
+saveRDS(
+  sce, 
+  file = "results/R_objects/10X_SingleCellExperiment_filt&norm.RDS"
+)
+```
+
+# Session Info
+```{r}
+sessionInfo()
+```
+
+
+
+
+
+
+
+
+
+
+
+

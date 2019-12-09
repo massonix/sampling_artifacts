@@ -1,0 +1,441 @@
+---
+title: "Cell Type Annotation - T cell activation"
+author: "Ramon Massoni-Badosa"
+date: "10/7/2019"
+output: 
+  BiocStyle::html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, out.width = "100%", fig.align='center', 
+                      message=FALSE, warning = FALSE)
+options(width = 1200)
+```
+
+# Introduction
+In the previous notebook, we filtered and normalized the expression matrix. In this notebook, we aim to annotate all cells to their corresponding cell type. Furthermore, we will try to identify cycling cells.
+
+# Pre-processing
+
+## Package loading
+
+```{r}
+library(scater)
+library(scran)
+library(Seurat)
+library(ggpubr)
+library(kBET)
+library(cluster)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(viridis)
+library(tidyverse)
+```
+
+## Source script with functions
+
+```{r}
+source("bin/utils.R")
+```
+
+## Load data
+
+```{r}
+t_act_l <- readRDS("results/R_objects/t_act_Seurat_list_filtered_normalized.rds")
+```
+
+Note that this analysis was done with the first 2 donors (replicates). We will analyse the remaining two (rep2) in a subsequent notebook:
+
+```{r}
+t_act_l <- t_act_l[c("day_0_rep1", "day_2_rep1")]
+names(t_act_l) <- c("day_0", "day_2")
+```
+
+# Find Variable Genes
+To cluster our cells, we need to overcome 2 challenges:
+
+1. The 'curse of dimensionality': as each cell can be conceived as a vector with >10,000 genes, and as two random cells will have the very similar expression for most genes, the distance measured between any given pair of cells will be very low, thus being unreliable for proper comparisons.
+2. Computational complexity: as the data is highly dimensional, even the most greedy algorithm will take long to complete. 
+3. Most genes should not be differentially expressed between cells, so the observed differences in such genes will be due to technical issues or transient biological states, that may confound the true structure in the dataset.
+
+Thus, we aim to eliminate redundancy and denoise the dataset. To this end, we will find the subset of genes that drive most of the variability in the expression matrix (feature selection). Seurat calculates the average expression and dispersion for each gene. Then, it divides genes into bins based on its average, and for each bin computes a z-score per gene. Those genes with a z-score above a certain cutoff are categorized as highly variable. The binning step is vital, since genes with more UMI tend to have more dispersion.
+
+To annotate the cell types, we are going to analyze each day and donor separately, as we need as much resolution as possible to detect the markers.
+
+```{r}
+t_act_0 <- SplitObject(t_act_l$day_0, split.by = "donor")
+t_act_2 <- SplitObject(t_act_l$day_2, split.by = "donor")
+t_act_l <- list(t_act_0$Male, t_act_0$Female, t_act_2$Male, t_act_2$Female)
+names(t_act_l) <- c("0M", "0F", "2M", "2F")
+t_act_l <- purrr::map(t_act_l, FindVariableFeatures)
+var_plots <- purrr::map(t_act_l, VariableFeaturePlot)
+var_plots <- purrr::map2(t_act_l, var_plots, function(seurat, p) {
+  LabelPoints(
+  plot = p, 
+  points =  head(VariableFeatures(seurat), 10), 
+  repel = TRUE
+  )
+})
+var_plots
+```
+
+As we can see, we reduce the number of dimensions from >10,000 genes to ~2000 highly variable genes (HVG). We observe that among the top HVG there are well-known PBMC markers, such as LYZ, S100A8 (monocytes), GNLY and NKG7 (natural killer and CD8+ T cells). Moreover, we see that IFNG is amongst the most variable genes in day 2, which is consistent with the fact that the T cells in this dataset were activated with anti-CD3 antibodies.
+
+# Scale data
+An important pre-processing step in any cluster analysis is to scale the data, as otherwise variables with a higher mean will have a higher weight in the distance metric:
+
+```{r}
+t_act_l <- purrr::map(t_act_l, ScaleData)
+```
+
+# Linear dimensionality reduction (PCA)
+An additional challenge in our cluster analysis is that scRNAs-seq is very noisy (very susceptible to technical artifacts), and very sparse (contains drop-outs). Thus, differences in single genes may not be accurate to identify cell types. To that end, we can perform Principal Component Analysis, as PC can be conceived as a 'metagene' that includes information across a correlated gene set. Furthermore, we will reduce the dimensionality even more:             
+
+```{r}
+t_act_l <- purrr::map(t_act_l, RunPCA)
+purrr::map(t_act_l, VizDimLoadings, dims = 1:3, reduction = "pca")
+purrr::map(t_act_l, DimPlot, reduction = "pca")
+```
+
+
+# Cluster cells
+To cluster cells we will used the Seurat's built-in functions `FindNeighbors` and `FindClusters`, which use the graph-based [Louvain](https://en.wikipedia.org/wiki/Louvain_modularity) algorithm. The critical parameter for these functions is the resolution, which will determine the final number of clusters. To decide it, we will compute the silhouette width for varying resolutions, and choose the one that maximizes it. Thus, we will end up with clusters that will be very similar within them and dissimilar between them:
+
+```{r}
+t_act_l <- purrr::map(t_act_l, FindNeighbors, dims = 1:20)
+resolutions <- c(
+  0.005,
+  seq(0.01, 0.1, by = 0.01),
+  seq(0.1, 1, by = 0.1), seq(1, 10, by = 1)
+)
+avgs_sil_width_dfs <- purrr::map2(t_act_l, names(t_act_l), function(seurat, condition) {
+  print(condition)
+  avgs_sil_width_df <- data.frame(num_k = c(), sil_width = c(), resolution = c())
+  num_k <- 1
+  for (res in resolutions) {
+    print(str_c("Current resolution is ", res))
+    seurat <-  FindClusters(seurat, resolution = res, verbose = FALSE)
+    curr_num_k <- length(levels(seurat$seurat_clusters))
+    if (curr_num_k == num_k) {
+      next
+    } else {
+      sil_width <- calc_sil_width(
+        object = seurat, 
+        clusters = seurat$seurat_clusters, 
+        npcs = 5, 
+        ncell = 2500
+      )
+      print(str_c("Current silhouette width is ", sil_width))
+      curr_df <- data.frame(num_k = curr_num_k, sil_width = sil_width, resolution = res)
+      avgs_sil_width_df <- rbind(avgs_sil_width_df, curr_df)
+      num_k <- curr_num_k 
+      print(str_c("Current number of clusters is ", num_k))
+    }
+  }
+  avgs_sil_width_df
+})
+resolution_plots <- purrr::map2(avgs_sil_width_dfs, names(avgs_sil_width_dfs), function(df, cond) {
+  ggplot(df, aes(num_k, sil_width, label = num_k)) +
+    geom_text() +
+    labs(title = cond,
+         x = "Number of clusters (k)", 
+         y = "Average Silhouette Width") +
+    theme_classic() +
+    theme(plot.title = element_text(hjust = 0.5))
+})
+resolution_plots
+```
+
+We aim to determine a number of clusters that maximizes silhouette width while preventing overstratification. Judgding by the previous plots, we define the following k:
+
+* Day 0 - Male: 6
+* Day 0 - Female: 6
+* Day 2 - Male: 3
+* Day 2 - Female: 3
+
+```{r}
+optimal_k <- c(6, 6, 4, 3)
+t_act_l <- purrr::pmap(list(t_act_l, avgs_sil_width_dfs, optimal_k), function(seurat, df, opt_k) {
+  opt_resolution <- df[df$num_k == opt_k, "resolution"]
+  seurat <- FindClusters(object = seurat, resolution = opt_resolution)
+  seurat
+})
+purrr::map(t_act_l, ~ length(levels(.x$seurat_clusters)))
+```
+
+# Non-linear dimensionality reduction 
+We can visualize the former clusters with a t-Stochastic Neighbor Embedding (tSNE) and uniform manifold approximation and projection (UMAP), which allow to depict more structure in the data than PCA:
+
+```{r}
+t_act_l <- purrr::map(t_act_l, function(seurat) {
+  seurat@reductions$PCA <- NULL
+  seurat@reductions$TSNE <- NULL
+  seurat@reductions$UMAP <- NULL
+  seurat
+})
+t_act_l <- purrr::map(t_act_l, RunTSNE, reduction = "pca", dims = 1:20)
+t_act_l <- purrr::map(t_act_l, RunUMAP, reduction = "pca", dims = 1:20)
+purrr::map(t_act_l, DimPlot, reduction = "tsne")
+purrr::map(t_act_l, DimPlot, reduction = "umap")
+saveRDS(t_act_l, file = "results/R_objects/t_act_Seurat_list_pre_processed.rds")
+# t_act_l <- readRDS("results/R_objects/t_act_Seurat_list_pre_processed.rds")
+```
+
+# Find cluster markers
+Let us find the markers for each of the clusters. That is, the genes that are exclusively expressed in one cluster:
+
+```{r}
+markers_l <- purrr::map(t_act_l, FindAllMarkers)
+saveRDS(markers_l, file = "results/R_objects/t_act_markers_list.rds")
+marker_selection <- purrr::map2(t_act_l, markers_l, function(seurat, df) {
+  num_k <- length(unique(seurat$seurat_clusters))
+  selection <- unlist(purrr::map(0:(num_k-1), ~df[df$cluster == .x, "gene"][0:8]))
+  selection
+})
+heatmaps_markers <- purrr::map2(t_act_l, marker_selection, ~DoHeatmap(.x, features = .y) + NoLegend())
+heatmaps_markers
+```
+
+# Cell cycle scoring
+After inspecting the markers, there are still some clusters of unknown identity. Let us shed more light by detecting the cycling cells in our datasets using cell cycle signatures:
+
+```{r}
+t_act_l <- purrr::map(t_act_l, function(seurat) {
+  s_genes <- cc.genes$s.genes[cc.genes$s.genes %in% rownames(seurat@assays$RNA@scale.data)]
+  g2m_genes <- cc.genes$g2m.genes[cc.genes$g2m.genes %in% rownames(seurat@assays$RNA@scale.data)]
+  seurat <- CellCycleScoring(object = seurat, s.features = s_genes, g2m.features = g2m_genes)
+  seurat
+})
+cycling_gg <- purrr::map(t_act_l, FeaturePlot, features = c("S.Score", "G2M.Score"), cols = viridis(20))
+cycling_gg
+```
+
+# T cell stimulation signature
+Finally, as we stimulated the PBMC with anti-CD3 antibody, we aim to find which cells exhibit an activated T cell signature. Thus, we will manually curate the upregulated genes from [Garcia-Sousa I, et al.](https://bmcgenomics.biomedcentral.com/articles/10.1186/s12864-019-5967-8#Sec20), where they profiled the gene expression changes upon human T cell stimulation with anti-CD3 antibodies.
+
+```{r}
+anti_cd3_signature <- c("IL2RA", "IL1R", "IL12RB2", "IL18R1", "IL21R", "IL23R", 
+                        "FOXP3", "CTLA4", "TNFRSF18", "LAG3", "PDCD1", "INFG", 
+                        "IL17A", "IL17F", "LIF", "TNF", "IL1B", "IL6", "IL32", 
+                        "IL2", "IL3", "IL9", "IL12B", "IL21", "IL22", "CD25", 
+                        "IL1R2", "TBX21", "STAT4", "GMZB", "EOMES", "GZMB", 
+                        "TNFRSF4", "TNFRSF9", "GITR", "XCL1", "IDO1", "NR4A1", 
+                        "RORC")
+t_act_l <- purrr::map(
+  t_act_l, 
+  AddModuleScore, 
+  features = list(anti_cd3_signature), 
+  name = "anti_cd3_score"
+)
+anti_cd3_gg <- purrr::map(
+  t_act_l, 
+  FeaturePlot, 
+  features = "anti_cd3_score1", 
+  reduction = "umap",
+  cols = viridis(30),
+  pt.size = 1.25
+)
+anti_cd3_gg
+```
+
+#  Annotation
+With the previous results, we can proceed to annotate the cells to its corresponding cell type
+
+NOTE: 
+- Comment on AIF1 , GZMA, GZMB, GZMH as markers of activated T cells
+- Comment on: anti CD3 signature also detects active cells in non-active datasets (cytotoxic cells). Most upregulated GO term in the anti CD3 paper is cell cycle, comment on the fact that we use cell cycle as a proxy to detect active T cells.
+
+## Day 0 - Male donor
+
+Cluster ID | Cell type       
+-----------|---------------
+0          | CD4 T 
+1          | Monocytes          
+2          | Cytotoxic
+3          | B 
+4          | FCGR3A Monocytes 
+5          | Dendritic Cells
+
+```{r}
+FeaturePlot(t_act_l$`0M`, features = "IL7R")
+t_act_l$`0M`$cell_type <- case_when(
+  t_act_l$`0M`$seurat_clusters == "0" ~ "CD4 T",
+  t_act_l$`0M`$seurat_clusters == "1" ~ "Monocyte",
+  t_act_l$`0M`$seurat_clusters == "2" ~ "Cytotoxic",
+  t_act_l$`0M`$seurat_clusters == "3" ~ "B",
+  t_act_l$`0M`$seurat_clusters == "4" ~ "FCGR3A Monocyte",
+  t_act_l$`0M`$seurat_clusters == "5" ~ "Dendritic Cell"
+)
+Idents(t_act_l$`0M`) <- "cell_type"
+DimPlot(t_act_l$`0M`, reduction = "umap", label = TRUE) + NoLegend()
+```
+
+
+## Day 0 - Female donor
+
+Cluster ID | Cell type       
+-----------|---------------
+0          | CD4 T
+1          | Cytotoxic   
+2          | Monocyte
+3          | B
+4          | Monocyte
+5          | Unknown
+
+```{r}
+FeaturePlot(t_act_l$`0F`, features = "IL7R")
+t_act_l$`0F`$cell_type <- case_when(
+  t_act_l$`0F`$seurat_clusters == "0" ~ "CD4 T",
+  t_act_l$`0F`$seurat_clusters == "1" ~ "Cytotoxic",
+  t_act_l$`0F`$seurat_clusters == "2" ~ "Monocyte",
+  t_act_l$`0F`$seurat_clusters == "3" ~ "B",
+  t_act_l$`0F`$seurat_clusters == "4" ~ "Monocyte",
+  t_act_l$`0F`$seurat_clusters == "5" ~ "Unknown"
+)
+Idents(t_act_l$`0F`) <- "cell_type"
+DimPlot(t_act_l$`0F`, reduction = "umap", label = TRUE) + NoLegend()
+```
+
+## Day 2 - Male donor
+
+Cluster ID | Cell type       
+-----------|---------------
+0          | Cycling           
+1          | CD4 T
+2          | Cytotoxic  
+3          | B 
+
+```{r}
+t_act_l$`2M`$cell_type <- case_when(
+  t_act_l$`2M`$seurat_clusters == "0" ~ "Cycling",
+  t_act_l$`2M`$seurat_clusters == "1" ~ "CD4 T",
+  t_act_l$`2M`$seurat_clusters == "2" ~ "Cytotoxic",
+  t_act_l$`2M`$seurat_clusters == "3" ~ "B"
+)
+Idents(t_act_l$`2M`) <- "cell_type"
+DimPlot(t_act_l$`2M`, reduction = "umap", label = TRUE) + NoLegend()
+```
+
+
+## Day 2 - Female donor
+
+Cluster ID | Cell type       
+-----------|---------------
+0          | T
+1          | Cycling          
+2          | B 
+
+```{r}
+t_act_l$`2F`$cell_type <- case_when(
+  t_act_l$`2F`$seurat_clusters == "0" ~ "T",
+  t_act_l$`2F`$seurat_clusters == "1" ~ "Cycling",
+  t_act_l$`2F`$seurat_clusters == "2" ~ "B"
+)
+Idents(t_act_l$`2F`) <- "cell_type"
+DimPlot(t_act_l$`2F`, reduction = "umap", label = TRUE) + NoLegend()
+```
+
+
+# Save
+
+```{r}
+saveRDS(t_act_l, file = "results/R_objects/t_act_Seurat_list_annotated")
+```
+
+```{r}
+# t_act <- SplitObject(t_act, split.by = "donor")
+# 
+# # Male
+#   t_act_m <- pre_process_seurat(t_act$Male)
+#   Idents(t_act_m) <- "day"
+#   umap_day <- DimPlot(t_act_m, reduction = "umap", pt.size = 0.9)
+#   Idents(t_act_m) <- "time"
+#   umap_time <- DimPlot(t_act_m, reduction = "umap", pt.size = 0.9)
+#   ggarrange(plotlist = list(umap_day, umap_time))
+#   monocyte_male <- FeaturePlot(t_act_m, features = "LYZ", reduction = "umap", pt.size = 0.9)
+# 
+# # Female
+# t_act_f <- pre_process_seurat(t_act$Female)
+# Idents(t_act_f) <- "day"
+# umap_day <- DimPlot(t_act_f, reduction = "umap", pt.size = 0.9)
+# Idents(t_act_f) <- "time"
+# umap_time <- DimPlot(t_act_f, reduction = "umap", pt.size = 0.9)
+# ggarrange(plotlist = list(umap_day, umap_time))
+# monocyte_female <- FeaturePlot(t_act_f, features = "LYZ", reduction = "umap", pt.size = 0.9)
+# monocyte_female
+# 
+# 
+# # score with stimulated-T cells signature
+# t_act_f <- AddModuleScore(t_act_f, features = list(t_stimuli_sign), name = "stimulated_t_score")
+# FeaturePlot(t_act_f, features = "stimulated_t_score1", reduction = "umap", pt.size = 0.9)
+# 
+# FeaturePlot(t_act_f, features = "TRAC", reduction = "umap", pt.size = 0.9)
+```
+
+EXPLORATORY2:
+
+```{r}
+# Split by day and donor: Day 0 - Male Donor
+# seurat_l <- SplitObject(t_act$day_0, split.by = "donor")
+# seurat <- seurat_l$Male
+# seurat <- pre_process_seurat(seurat)
+# seurat <- FindVariableFeatures(seurat)
+# seurat <- ScaleData(seurat)
+# seurat <- RunPCA(seurat)
+# seurat <- RunUMAP(seurat, dims = 1:15, reduction = "pca")
+# seurat@reductions$UMAP <- NULL
+# Idents(seurat) <- "time"
+# DimPlot(seurat, reduction = "umap", pt.size = 0.8)
+# seurat <- FindNeighbors(seurat)
+# seurat <- FindClusters(seurat, dims = 1:20, reduction = "pca", resolution = 0.1)
+# DimPlot(seurat, reduction = "umap", pt.size = 0.8)
+# markers <- FindAllMarkers(seurat)
+# marker_selection <- unlist(map(0:5, ~markers[markers$cluster == ., "gene"][0:5]))
+# marker_selection
+# DoHeatmap(seurat, features = marker_selection) + NoLegend()
+# FeaturePlot(seurat, features = c("IL7R", "GNLY", "LYZ", "MS4A1", "FCGR3A"), reduction = "umap")
+# 
+# 
+# # Split by day and donor: Day 2 - Male Donor
+# seurat_l <- SplitObject(t_act$day_2, split.by = "donor")
+# seurat <- seurat_l$Male
+# seurat <- pre_process_seurat(seurat)
+# seurat@reductions$UMAP <- NULL
+# Idents(seurat) <- "time"
+# DimPlot(seurat, reduction = "umap", pt.size = 0.8)
+# seurat <- FindNeighbors(seurat)
+# seurat <- FindClusters(seurat, dims = 1:20, reduction = "pca", resolution = 0.1)
+# DimPlot(seurat, reduction = "umap", pt.size = 0.8)
+# markers <- FindAllMarkers(seurat)
+# marker_selection <- unlist(map(0:4, ~markers[markers$cluster == ., "gene"][0:10]))
+# marker_selection
+# DoHeatmap(seurat, features = marker_selection) + NoLegend()
+# FeaturePlot(seurat, features = c("IL7R", "GNLY", "MS4A1"), reduction = "umap")
+# 
+# seurat <- subset(seurat, subset = seurat_clusters != "2")
+# seurat <- CellCycleScoring(seurat, s.features = cc.genes$s.genes, g2m.features = cc.genes$g2m.genes)
+# FeaturePlot(seurat, features = c("S.Score", "G2M.Score"))
+# seurat <- pre_process_seurat(seurat, vars_to_regress = c("S.Score", "G2M.Score"))
+# DimPlot(seurat, reduction = "umap", pt.size = 0.8)
+# markers2 <- FindAllMarkers(seurat)
+# marker_selection2 <- unlist(map(c(0,1,3,4), ~markers2[markers2$cluster == ., "gene"][0:8]))
+# marker_selection2
+# DoHeatmap(seurat, features = marker_selection) + NoLegend()
+# FeaturePlot(seurat, features = c("IL7R", "GNLY", "MS4A1", "IFNG"), reduction = "umap")
+# Idents(seurat) <- "seurat_clusters"
+# DimPlot(seurat, reduction = "umap", pt.size = 0.8)
+# 
+# b <- subset(seurat, idents = "4")
+# b <- pre_process_seurat(b)
+# Idents(b) <- "time"
+# DimPlot(b, reduction = "umap", pt.size = 0.8)
+# b <- FindNeighbors(b)
+# b <- FindClusters(b, resolution = 0.2)
+# DimPlot(b, reduction = "umap", pt.size = 0.8)
+# markers_b <- FindAllMarkers(b)
+
+```
+

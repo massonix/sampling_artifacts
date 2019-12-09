@@ -1,0 +1,235 @@
+---
+title: "Clustering"
+author: "Ramon Massoni-Badosa"
+date: "2019/04/09"
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, out.width = "100%", fig.align='center', 
+                      message=FALSE, warning = FALSE)
+options(width = 1200)
+```
+
+
+# Introduction
+
+In previous notebooks, we have assigned each cell to its condition (0h, 8h, etc.), we have filtered low-quality cells, and we have normalized gene counts to correct for biases such as differences in library size. The result of that is a `SingleCellExperiment` object that we saved as .RDS and that will be our starting point in this analysis.
+
+Here, we aim to cluster cells to identify each cell type. Hence, we are going to use [Seurat](https://satijalab.org/seurat/), a CRAN package that has become a swiss-knife for scRNA-seq analysis. As described in [Kiselev *et al*](https://www.nature.com/articles/s41576-018-0088-9), Seurat uses a graph-based clustering algorithm that is scalable to datasets with thousands of cells. Therefore, we will leverage such scalability to cluster >11,000 cells contained in the SCE object.
+
+## Package loading
+
+```{r}
+library(SingleCellExperiment)
+library(scater)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(Seurat)
+library(cowplot)
+library(ggpubr)
+library(purrr)
+library(tidyverse)
+```
+
+## Source script with functions
+
+```{r}
+source("bin/utils.R")
+```
+
+# Create seurat object
+Seurat uses its own single-cell data container, a so-called `Seurat` object. Hence, we first need to convert the SCE to this new data structure:
+
+```{r}
+date <- Sys.Date()
+
+# Load SingleCellExperiment
+sce <- readRDS("results/R_objects/10X_SingleCellExperiment_filt&norm.RDS")
+
+# To increase interpretability downstream, change rownames from ensembl to gene 
+# symbol
+rownames(sce) %>% 
+  table() %>% 
+  sort(decreasing = TRUE) %>% 
+  head(10)
+ind <- match(c("PNRC2", "SRSF10"), rownames(sce))
+rownames(sce)[ind] <- c("PNRC2.1", "SRSF10.1")
+
+# Convert SCE to Seurat
+seurat <- as.Seurat(sce)
+```
+As we have two donors (male/female), we will annotate them separately.
+
+# Find Variable Genes
+To cluster our cells, we need to overcome 2 challenges:
+
+1. The 'curse of dimensionality': as each cell can be conceived as a vector with >10,000 genes, and as two random cells will have most of each genes equal, the distance measured between any given pair of cells will be very low, thus being unreliable for proper comparisons.
+2. Computational complexity: as the data is highly dimensional, even the most greedy algorithm will take long to complete. 
+3. Most genes should not be differentially expressed between cells, so the observed differences in such genes will be due to technical issues or transient biological states, that may confound the true structure in the dataset.
+
+A first approach to tackle these challenges consists of finding the most variable genes as a means of feature selection. That is, to find the subset of genes that drive most of the variability in the expression matrix. Seurat calculates the average expression and dispersion for each gene. Then, it divides genes into bins based on its average, and for each bin computes a z-score per gene. Those genes with a z-score above a certain cutoff are categorized as highly variable. The binning step is vital, since genes with more UMI tend to have more dispersion.
+
+```{r}
+seurat_l <- SplitObject(seurat, split.by = "donor")
+seurat_l <- purrr::map(seurat_l, FindVariableFeatures)
+purrr::map(seurat_l, ~ length(VariableFeatures(.x)))
+```
+
+As we can see, we reduce the number of dimensions from >10,000 genes to 319 HVG.
+
+# Scale data
+An important pre-processing step in any cluster analysis is to scale the data, as otherwise variables with a higher mean will have a higher weight in the distance metric. Remember that we observed batch effects, so we regress out the "batch" variable:
+
+```{r}
+seurat_l <- purrr::map(seurat_l, ScaleData, vars.to.regress = "batch")
+```
+
+# Linear dimensionality reduction (PCA)
+An additional challenge in our cluster analysis is that scRNAs-seq is very noisy (very susceptible to technical artifacts), and very sparse (contains drop-outs). Thus, differences in single genes may not be accurate to identify cell types. To that end, we can perform Principal Component Analysis, as PC can be conceived as a 'metagene' that includes information across a correlated gene set. Furthermore, we will reduce the dimensionality even more.
+
+```{r}
+seurat_l <- purrr::map(seurat_l, RunPCA)
+purrr::map(seurat_l, VizDimLoadings, dims = 1:2)
+purrr::map(seurat_l, PCHeatmap, dims = 1, balanced = TRUE)
+```
+
+# Cluster cells
+Seurat uses the Louvain algorithm to cluster cells:
+
+```{r}
+seurat_l <- purrr::map(seurat_l, FindNeighbors, dims = 1:15)
+seurat_l <- purrr::map(seurat_l, FindClusters, resolution = 0.05)
+```
+
+# Non-linear dimensionality reduction (UMAP/tSNE)
+We can visualize the former clusters with a t-Stochastic Neighbor Embedding (tSNE) and a Uniform Manifold Approximation and Projection (UMAP), which allow to depict more structure in the data than PCA:
+
+```{r}
+seurat_l <- purrr::map(seurat_l, RunTSNE, dims = 1:15)
+seurat_l <- purrr::map(seurat_l, RunUMAP, dims = 1:15)
+seurat_l <- purrr::map(seurat_l, function(s) {
+  s@reductions$PCA <- NULL
+  s@reductions$TSNE <- NULL
+  s@reductions$UMAP <- NULL
+  s
+})
+purrr::map(seurat_l, DimPlot, reduction = "tsne")
+purrr::map(seurat_l, DimPlot, reduction = "umap")
+```
+
+As we can see, there are 5 major clusters. Interestingly:
+
+```{r}
+purrr::map(seurat_l, function(s) {
+  Idents(s) <- "batch"
+  DimPlot(s)
+})
+```
+
+Regressing out the batch effect with the `ScaleData` function from above removed the majority of the batch effect.
+
+# Find differentially expressed genes (cluster biomarkers)
+Let us find the markers of each of the clusters above. In other words, let us find which genes are exclusively expressed in each cluster and will help us identify the cell types in our data set:
+
+```{r}
+markers <- purrr::map(seurat_l, FindAllMarkers)
+saveRDS(markers, file = "results/R_objects/pbmc_markers_list.rds")
+marker_selection <- purrr::map2(seurat_l, markers, function(seurat, df) {
+  num_k <- length(unique(seurat$seurat_clusters))
+  selection <- unlist(purrr::map(0:(num_k-1), ~df[df$cluster == .x, "gene"][0:8]))
+  selection
+})
+marker_selection <- purrr::map(marker_selection, ~ c("IL7R", .x))
+heatmaps_markers <- purrr::map2(seurat_l, marker_selection, ~DoHeatmap(.x, features = .y) + NoLegend())
+heatmaps_markers
+```
+
+## Assigning cell type identity to clusters
+Based on the previously found markers, we can annotate each cluster to known cell types:
+
+## Male
+Cluster ID | Markers       | Cell Type
+-----------|---------------|----------
+0          | IL7R          | T cells
+1          | GNLY, NKG7    | Natural Killer (NK)
+2          | LYZ, S100A8   | Monocytes
+3          | MS4A1, CD79B  | B cells
+
+```{r}
+seurat_l$male$cell_type <- factor(seurat_l$male$seurat_clusters)
+levels(seurat_l$male$cell_type) <- c("T", "NK", "Monocyte", "B")
+```
+
+## Female
+Cluster ID | Markers       | Cell Type
+-----------|---------------|----------
+0          | IL7R          | T cells
+1          | GNLY, NKG7    | Natural Killer (NK)
+2          | LYZ, S100A8   | Monocytes
+3          | MS4A1, CD79B  | B cells
+
+```{r}
+seurat_l$female$cell_type <- factor(seurat_l$female$seurat_clusters)
+levels(seurat_l$female$cell_type) <- c("T", "NK", "Monocyte", "B")
+```
+
+We can visualize the annotation with all cells pooled together:
+
+```{r}
+cell_type_df <- purrr::map(seurat_l, ~ .x@meta.data[, "cell_type", drop = FALSE])
+cell_type_df <- cell_type_df %>% 
+  purrr::map(rownames_to_column, var = "barcode") %>% 
+  bind_rows(.id = "donor")
+rownames(cell_type_df) <- cell_type_df$barcode
+cell_type_df <- cell_type_df[colnames(seurat), ]
+seurat$cell_type <- cell_type_df$cell_type
+seurat <- pre_process_seurat(seurat, vars_to_regress = "batch")
+Idents(seurat) <- "cell_type"
+umap_annot <- DimPlot(seurat, reduction = "umap", label = TRUE) + NoLegend()
+umap_markers <- FeaturePlot(seurat, features = c("IL7R", "GNLY", "LYZ", "MS4A1"), reduction = "umap")
+saveRDS(umap_annot, file = "results/R_objects/ggplots/umap_annotation_pbmc.rds")
+saveRDS(umap_markers, file = "results/R_objects/ggplots/umap_markers_pbmc.rds")
+umap_annot
+umap_markers
+```
+
+# Save
+
+```{r}
+saveRDS(seurat, "results/R_objects/10X_pbmc_Seurat_clustered.RDS")
+saveRDS(seurat_l, "results/R_objects/10X_pbmc_Seurat_donors_list_clustered.RDS")
+# Recode variables
+# seurat <- colData(sce2)[, c("batch", "donor", "ident", "condition")]
+# conds <- c("0h", "2h", "8h", "24h_RT", "48h_RT", "24h_4C", "48h_4C")
+# sce2$condition <- factor(sce2$condition, levels = conds)
+# 
+# levels(sce2$condition) <- conds %>% 
+#   str_remove("RT") %>% 
+#   str_remove("_")
+# sce2$temperature <- case_when(
+#   sce2$condition == "0h" ~ "gold",
+#   sce2$condition %in% c("2h", "8h", "24h", "24hBioabank", "48h") ~ "room temperature",
+#   sce2$condition %in% c("24h4C", "48h4C") ~ "4ºC"
+# )
+# sce2$condition <- str_remove(as.character(sce2$condition), "4C")
+# colnames(colData(sce2)) <- c("batch", "sex", "cell_type", "time", "temperature")
+# 
+# # Recode rowData variables
+# rowData(sce2) <- rowData(sce)
+# 
+# # Save as RDS
+# saveRDS(sce2, "results/R_objects/10X_SingleCellExperiment_clustered.RDS")
+```
+
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
+
+
+
+
+
+
+

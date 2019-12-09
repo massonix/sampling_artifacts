@@ -1,0 +1,222 @@
+---
+title: "Effect Sampling Time on CLL scRNA-seq profiles"
+author: "Ramon Massoni-Badosa"
+date: "7/16/2019"
+output: 
+  BiocStyle::html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, out.width = "100%", fig.align='center', 
+                      message=FALSE, warning = FALSE)
+options(width = 1200)
+```
+
+# Introduction
+We now have a Seurat object demultiplexed, filtered, normalized and annotated. The objective of this notebook is to assess the effect of sampling time on the single-cell transcriptomes of chornic lymphocytic leukemia (CLL) cells.
+
+# Pre-processing
+
+## Package loading
+
+```{r}
+library(scater)
+library(scran)
+library(Seurat)
+library(ggpubr)
+library(biomaRt)
+library(org.Hs.eg.db)
+library(GOstats)
+library(ggrepel)
+library(viridis)
+library(pheatmap)
+library(tidyverse)
+```
+
+## Source script with functions
+
+```{r}
+source("bin/utils.R")
+```
+
+## Load data
+
+```{r}
+cll_seu <- readRDS("results/R_objects/cll_seurat_annotated.rds")
+```
+
+# Visualize the effect of sampling time
+
+Notice that the previous Seurat object contains both cells that were kept at room temperature (RT) and cells that were kept in the fridge (4ºC). In most studies, blood samples are kept at RT. Thus, we will start by subsetting to this temperature:
+
+```{r}
+cll_rt <- subset(cll_seu, temperature == "RT")
+```
+
+As we have eliminated the variability associated with temperature from the dataset, the highly variable genes will change as well. Hence, we need to run the Seurat pipeline again:
+
+```{r}
+# Seurat pipeline
+cll_rt <- pre_process_seurat(cll_rt)
+saveRDS(cll_rt, "results/R_objects/cll_seurat_fig1.rds")
+
+# Visualize UMAP and tSNE
+Idents(cll_rt) <- "time"
+umap_rt <- DimPlot(cll_rt, reduction = "umap", cols = viridis(6))
+umap_rt <- umap_rt + labs(x = "UMAP1", y = "UMAP2")
+tsne_rt <- DimPlot(cll_rt, reduction = "tsne", pt.size = 1.5, cols = viridis(6))
+tsne_rt <- tsne_rt + labs(x = "tSNE1", y = "tSNE2")
+saveRDS(umap_rt, file = "results/R_objects/ggplots/umap_RT_CLL.rds")
+umap_rt
+tsne_rt
+```
+
+Strikingly, we see how, for every cell type or donor, cells left at RT for >= 4h differ transcriptionally from those left at 0h or 2h. Moreover, this effect intensifies in a time-dependent manner, with 24h cells segregating completely from the fresh ones (0h).
+
+# Patient-specific effect
+
+To gain more insight into how universal or specific this effect is across CLL patients, we will split the seurat object by donor. Moreover, we will only keep leukemic cells, as we already analysed PBMCs in a separate subproject:
+
+```{r}
+cll_rt <- subset(cll_rt, subset = cell_type %in% c("CLL 1892", "CLL 1472", "CLL 1220"))
+cll_rt_l <- SplitObject(cll_rt, split.by = "donor")
+
+# Reorder list in ascending id
+names(cll_rt_l)
+cll_rt_l <- list(cll_rt_l$`1220`, cll_rt_l$`1472`, cll_rt_l$`1892`)
+names(cll_rt_l) <- c("1220", "1472", "1892")
+```
+
+As we do every time we subset a dataset, we will rerun the pipeline:
+
+```{r}
+cll_rt_l <- map(cll_rt_l, pre_process_seurat)
+umap_rt_l <- map2(cll_rt_l, c(5, 6, 6), function(seurat, n_colors) {
+  Idents(seurat) <- "time"
+  DimPlot(
+    seurat, 
+    reduction = "umap", 
+    pt.size = 1.25, 
+    cols = viridis(n_colors))
+})
+umap_rt_l <- ggarrange(
+  plotlist = umap_rt_l, 
+  ncol = 3, 
+  nrow = 1, 
+  labels = names(cll_rt_l),
+  hjust = -3
+)
+umap_rt_l
+```
+
+We observe the same gradient as above. Of note though, the structure of the three datasets is different. Specifically, donors 1472 and 1892 show an enhanced heterogeneity besides that explained by time; whilst donor 1220 shows a single 'blob'. This differences are explained by (1) the characteristic interpatient heterogeneity in cancer and (2) the fact that donor 1220 was sequenced not as deep as the other two. Also, note that we do not have time-point 0h for donor 1220.
+
+Let us now find the clusters for each CLL donor. We seek to elucidate if the different sampling times can be categorized in a similar fashion for each donor. As different donors present different structures, we need to tailor the resolutions
+
+```{r}
+cll_rt_l <- map2(cll_rt_l, c(0.11, 0.15, 0.12), function(seurat, res) {
+  seurat %>% 
+    FindNeighbors() %>% 
+    FindClusters(resolution = res)
+})
+umap_k_l <- map(cll_rt_l, DimPlot, reduction = "umap", pt.size = 1.25)
+umap_k_l <- ggarrange(
+  plotlist = umap_k_l, 
+  ncol = 3, 
+  nrow = 1, 
+  labels = names(cll_rt_l), 
+  hjust = -3
+)
+umap_k_l
+```
+
+We can plot the distribution of time-points for each cluster:
+
+```{r}
+stacked_barplots <- map2(cll_rt_l, c(5, 6, 6), function(seurat, n_colors) {
+  pct_df <- seurat@meta.data %>% 
+    select("seurat_clusters", "time") %>% 
+    group_by(seurat_clusters, time) %>% 
+    summarise(n_cells_time = n()) %>% 
+    group_by(seurat_clusters) %>% 
+    mutate(n_cells_cluster = sum(n_cells_time)) %>% 
+    ungroup() %>% 
+    mutate(pct_cells = n_cells_time / n_cells_cluster * 100) %>% 
+    mutate(seurat_clusters = str_c("C", seurat_clusters, sep = ""))
+  stacked_barplot <- ggplot(pct_df, aes(seurat_clusters, pct_cells, fill = time)) +
+    geom_col(alpha = 0.8) +
+    scale_fill_manual(values = viridis(n_colors)) +
+    labs(x = "", y = "Percentage of cells (%)", fill = "") +
+    theme_classic2()
+  stacked_barplot
+})
+stacked_barplots <- ggarrange(
+  plotlist = stacked_barplots, 
+  ncol = 3, 
+  nrow = 1, 
+  labels = names(cll_rt_l), 
+  hjust = -3
+)
+stacked_barplots
+```
+
+To interpret these plots, first we need to take into account how we can conceptualize the different time-points. As described in the [UK biobank sample handling and storage protocols](https://academic.oup.com/ije/article/37/2/234/789028), samples can be processed locally or centrally:
+
+- Local processing(<=8h): this is the case in which blood samples are collected in the same hospital, they are left at RT for several hours and, after a batch is complete, a technician cyropreserves it .
+- Central processing (>8h): the paradigmatic case of this is in multicentric studies, whereby blood samples are collected in a hospital and they are stored and shipped to another hospital where it will be processed.
+
+We also have the case of 0-2h, which we consider as "fresh" samples and they represent our gold-standard. The case that better recapitulates these categories is the donor 1472, in which the main cluster divides into 3 clusters: C0 consists mainly of fresh cells (0h, 2h), C1 of locally-processed-like cells (4h, 6h, 8h), and C2 of centrally-processed cells (24h). On the other hand, we also see a smaller cluster (C3) that depicts that consists of cells of all time-points and likely represents a CLL subclone.
+
+The donor 1220 is divided into 2 main clusters, C0 and C1 which consists mostly of locally and centrally processed cells, respectively. A similar pattern is observed in donor 1892, but in this case there is an extra cluster (C3) which might represent a CLL subpopulation.
+
+All in all, we observe that time is a major source of bias in all 3 donors. As we also see extra variability that is not associated with time, the next natural thing we can test is if time correlates with some of the first principal components (PCs):
+
+```{r}
+pcs_vs_time_ggs <- list()
+for (pc in c("PC_1", "PC_2", "PC_3")) {
+  pc_vs_time <- map2(cll_rt_l, c(5, 6, 6), function(seurat, n_colors) {
+    seurat@reductions$pca@cell.embeddings %>% 
+      as.data.frame() %>% 
+      select(pc) %>% 
+      mutate(time = seurat$time) %>% 
+      ggplot(aes_string("time", pc, color = "time")) +
+        geom_boxplot() +
+        scale_color_manual("", values = viridis(n_colors)) +
+        labs(x = "", y = pc) +
+        theme_classic() +
+        theme(axis.title = element_text(size = 13, face = "bold"),
+              axis.text.x = element_text(size = 11),
+              legend.position = "none")
+  })
+  pc_vs_time <- ggarrange(
+    plotlist = pc_vs_time, 
+    ncol = 3, 
+    nrow = 1, 
+    labels = names(cll_rt_l), 
+    hjust = -3
+  )
+  pcs_vs_time_ggs[[pc]] <- pc_vs_time
+}
+pcs_vs_time_ggs
+```
+
+As we can see, for donor 1472 the variance captured by PC1 is largely explained by time. Secondly, for donor 1220 there is an anticorrelation between time and PC1 and 2, whilst it directly correlates with PC3. Finally, PC2 of donor 1892 strongly correlates with time.
+
+# Conclusions
+In light of the above, we can conclude that processing time at RT is a unviersal source of technical artifacts in single-cell RNA datasets. However, the extent of this bias is donor-specific, and largely depends on the presence of other sources of variation (like tumor subclones) and depth of sequencing.
+
+# Save list of Seurat objects
+
+```{r}
+saveRDS(cll_rt_l, file = "results/R_objects/cll_rt_seurat_list.rds")
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
+

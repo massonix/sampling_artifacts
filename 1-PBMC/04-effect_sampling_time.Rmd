@@ -1,0 +1,190 @@
+---
+title: "Effect of Sampling Time"
+author: "Ramon Massoni-Badosa"
+date: "10/20/2019"
+output: 
+  BiocStyle::html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, out.width = "100%", fig.align='center', 
+                      message=FALSE, warning = FALSE)
+options(width = 1200)
+```
+
+# Introduction
+The objective of this notebook is to test if the time required to cryopreserve a blood sample is a source of technical artifacts in single-cell RNA-seq (scRNA-seq) data. We will do so by computing and visualizing the 'mixability' of PBMC that were kept at varying times (0h, 2h, 8h, 24h, 48h) prior to freezing.
+
+## Package loading
+
+```{r}
+library(scater)
+library(Seurat)
+library(ggpubr)
+library(purrr)
+library(kBET)
+library(tidyverse)
+```            
+
+## Source script with function definitions
+
+```{r}
+source("bin/utils.R")
+```
+
+## Load data
+Our data consists of a list of two (male/female) demultiplexed, filtered, normalized and annotated Seurat objects. Also, we have a merged dataset that combines both male and female:
+
+```{r}
+pbmc_l <- readRDS("results/R_objects/10X_pbmc_Seurat_donors_list_clustered.RDS")
+pbmc_l
+pbmc <- readRDS("results/R_objects/10X_pbmc_Seurat_clustered.RDS")
+pbmc <- subset(pbmc, subset = condition %in% c("0h", "2h", "8h", "24h_RT", "48h_RT"))
+```
+
+# Visualize mixability
+Let us visualize the mixability of the PBMCs with different sampling times. Our hypothesis is that, if this variable introduces artifacts, cells will cluster by time. 
+
+```{r}
+# Recode variables
+conds <- c("0h", "2h", "8h", "24h_RT", "48h_RT", "24h_4C", "48h_4C")
+pbmc_l <- purrr::map(pbmc_l, function(s) {
+  s$condition <- factor(s$condition, levels = conds)
+  levels(s$condition) <- conds %>%
+    str_remove("RT") %>%
+    str_remove("_")
+  s$temperature <- case_when(
+    s$condition == "0h" ~ "fresh",
+    s$condition %in% c("2h", "8h", "24h", "48h") ~ "RT",
+    s$condition %in% c("24h4C", "48h4C") ~ "4ºC"
+  )
+  s <- subset(s, subset = temperature != "4ºC")
+  s <- pre_process_seurat(s)
+  s$time <- s$condition
+  Idents(s) <- "time"
+  s
+})
+
+# Visualize mixability (UMAP)
+palette <- c("#999999", "#92e8df", "#632c63", "#e4624e", "#c0e212")
+umaps_time <- purrr::map(
+  pbmc_l, 
+  DimPlot, 
+  reduction = "umap", 
+  cols = palette
+)
+umaps_time
+
+# Visualize mixability (TSNE)
+tsnes_time <- purrr::map(
+  pbmc_l, 
+  DimPlot, 
+  reduction = "tsne", 
+  cols = palette
+)
+tsnes_time
+saveRDS(tsnes_time, "results/R_objects/ggplots/tsne_time_points_PBMC_Seuratv3.rds")
+saveRDS(pbmc_l$male, "results/R_objects/pbmc_Seurat_male.rds")
+```
+
+As we can see, within each cell type cells cluster by time.
+
+# Principal Component Analysis (PCA)
+Let us asses if, for each cell type, time is the major source of variance in the dataset:
+
+```{r}
+pbmc_types <- SplitObject(pbmc, split.by = "cell_type")
+pbmc_types <- purrr::map(pbmc_types, pre_process_seurat)
+pbmc_types_pca <- purrr::map(pbmc_types, function(seurat) {
+  df <- as.data.frame(seurat@reductions$pca@cell.embeddings[, 1:2])
+  df$time <- seurat$condition
+  df$time <- str_remove(df$time, "_RT")
+  df$time <- factor(df$time, levels = c("0h", "2h", "8h", "24h", "48h"))
+  df
+})
+pbmc_types_pca <- bind_rows(pbmc_types_pca, .id = "cell_type")
+pbmc_types_pca$cell_type <- factor(
+  pbmc_types_pca$cell_type, 
+  levels = c("T", "NK", "Monocyte", "B")
+)
+palette2 <- c("#c20a35", "#aa2edc", "#71bdd0", "#bbaa2a")
+pc1_vs_time <- pbmc_types_pca %>% 
+  filter(PC_1 < 15) %>% 
+  ggplot(aes(time, PC_1, fill = cell_type)) +
+    geom_boxplot(outlier.shape = NA) +
+    facet_grid(.~cell_type) +
+    labs(x = "", y = "PC1") +
+    scale_fill_manual("", values = palette2) +
+    theme_classic() +
+    theme(legend.position = "none",
+          axis.title.y = element_text(size = 13, face = "bold"))
+pc1_vs_time
+saveRDS(pc1_vs_time, "results/R_objects/ggplots/pc1_time_Seuratv3_gg.rds")
+```
+
+# Zoom-in into specific cell types
+
+```{r}
+pbmc_types <- map(pbmc_types, function(seurat) {
+  seurat$time <- seurat$condition
+  seurat$time <- str_remove(seurat$time, "_RT")
+  seurat$time <- factor(seurat$time, c("0h", "2h", "8h", "24h", "48h"))
+  Idents(seurat) <- "time"
+  seurat
+})
+pbmc_types <- map(pbmc_types, RunTSNE)
+tsne_types <- map(pbmc_types, DimPlot, reduction = "tsne", cols = c("#999999", "#92e8df", "#632c63", "#e4624e", "#c0e212"))
+saveRDS(tsne_types, "results/R_objects/ggplots/tsne_time_points_PBMC_cell_types_Seuratv3.rds")
+```
+
+# kBET
+
+To quantify the mixability between time-points, we will use the metric [kBET](https://www.nature.com/articles/s41592-018-0254-1). Intuitively, kBET quantifies as well-mixed those datasets for which most subsets of neareast neighbors have the same local batch distribution as the global of the dataset. The documentation of the package can be found [here](https://github.com/theislab/kBET).
+
+```{r}
+# Calculate rejection rates
+times <- c("2h", "8h", "24h", "48h")
+rejection_rate_df <- purrr::map(pbmc_l, function(seurat) {
+  Idents(seurat) <- "time"
+  rejection_rate_dbl <- purrr::map_dbl(times, function(t) {
+    seurat_sub <- subset(seurat, idents = c("0h", t))
+    seurat_sub$time <- seurat_sub$condition
+    seurat_sub$time <- str_remove(seurat_sub$time, "_RT")
+    seurat_sub$is_biased <- ifelse(seurat_sub$time == "0h", FALSE, TRUE)
+    Idents(seurat_sub) <- "time"
+    mat <- as.matrix(seurat_sub@reductions$umap@cell.embeddings)
+    batch <- seurat_sub$is_biased
+    batch_estimate <- kBET(mat, batch = batch, verbose = TRUE, heuristic = FALSE, testSize = 50)
+    batch_results <- batch_estimate$results
+    batch_results <- batch_results %>% 
+      mutate(cell_type = seurat_sub$cell_type,
+             time = seurat_sub$time) %>% 
+      filter(tested == 1) %>% 
+      summarise(rejection_rate = 100 - mean(kBET.pvalue.test > 0.05) * 100)
+    batch_results$rejection_rate
+  })
+  data.frame(time = times, rejection_rate = rejection_rate_dbl)
+})
+
+# Plot rejection rates
+rejection_rate_gg <- purrr::map(rejection_rate_df, function(df) {
+  df %>% 
+    mutate(time = factor(time, levels = c("2h", "8h", "24h", "48h"))) %>% 
+    ggplot(aes(time, rejection_rate)) + 
+      geom_col() +
+      labs(x = "", y = "kBET (rejection rate)") +
+      theme_classic()
+})
+rejection_rate_gg
+saveRDS(rejection_rate_gg, "results/R_objects/ggplots/barplot_rejection_rate_pbmc.rds")
+```
+
+# Session Information
+
+```{r}
+sessionInfo()
+```
+

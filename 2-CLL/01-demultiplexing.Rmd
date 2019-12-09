@@ -1,0 +1,182 @@
+---
+title: "Demultiplexing"
+author: "Ramon Massoni-Badosa"
+date: "7/12/2019"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, out.width = "100%", fig.align='center', 
+                      message=FALSE, warning = FALSE)
+options(width = 1200)
+```
+
+# Introduction
+
+In this project, we aim to understand the effect of time until cyropreservation (room temperature or 4ºC) on single-cell transcriptional profiles of chronic lymphocytic leukemia (CLL) cells.
+
+### Description of the data
+
+To that end, we drew blood from 3 CLL patients (ids: 1220, 1472, 1892) and cyropreserved the samples after 0h (fresh), 2h, 4h, 6h, 8h and 24h at either room temperature (RT) or 4ºC (4C). To eliminate batch effect, detect doublets and reduce the library cost, we used the [cell hashing protocol](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-018-1603-1), in which each condition (in our case time-points) is labeled with an antibody against ubiquitous cell surface markers that is crosslinked with a sample-specific hashtag oligonucleotide (HTO), that is sequenced together with the cDNA libraries. 
+
+* 1220_RT (note that we do not have 4ºC for this donor)
+* 1472_4C
+* 1472_RT
+* 1892_4C
+* 1892_RT
+
+For each of them, we have 3 files: the expression matrix in sparse format, the list of the barcodes that identify the columns, and the list of genes that identify the rows (features). Moreover, the features file contains a column that distinguishes between genes ("Gene Expression") and HTO ("Antibody Capture").
+
+### Objective
+
+The objective of this notebook is to demultiplex the barcodes (cells) back to its original time-point. To achive that, we will follow [the pipeline from Seurat](https://satijalab.org/seurat/v3.0/hashing_vignette.html):
+
+#Pre-processing
+
+## Load packages
+
+```{r}
+library(scater)
+library(SingleCellExperiment)
+library(Seurat)
+library(Matrix)
+library(tidyverse)
+```
+
+
+# Demultiplex 
+
+```{r}
+# Load expression matrix, gene and cell metadata
+libraries <- c("1472_RT", "1472_4C", "1892_RT", "1892_4C", "1220_RT")
+cll_list <- list()
+
+for (lib in libraries) {
+  lib_path <- str_c("data/BCLLATLAS_03/", lib, "/filtered_feature_bc_matrix/")
+  expression_matrix <- readMM(str_c(lib_path, "matrix.mtx.gz"))
+  barcodes <- read_csv(str_c(lib_path, "barcodes.tsv.gz"), col_names = FALSE)
+  colnames(barcodes) <- "barcode"
+  features <- read_tsv(str_c(lib_path, "features.tsv.gz"), col_names = FALSE)
+  colnames(features) <- c("ensembl", "symbol", "feature_type")
+  rownames(expression_matrix) <- features$symbol
+  colnames(expression_matrix) <- barcodes$barcode
+  
+  # Separate HTO and RNA matrices
+  hto_ind <- which(str_detect(features$feature_type, "Antibody Capture"))
+  rna_ind <- which(str_detect(features$feature_type, "Gene Expression"))
+  cll_hto <- expression_matrix[hto_ind, ]
+  cll_rna <- expression_matrix[rna_ind, ]
+  
+  # Setup Seurat object
+  cll <- CreateSeuratObject(counts = cll_rna)
+  
+  # Normalize RNA data with log normalization
+  cll <- NormalizeData(cll)
+  
+  # Find and scale variable features
+  cll <- FindVariableFeatures(cll, selection.method = "vst")
+  cll <- ScaleData(cll, features = VariableFeatures(cll))
+  
+  # Add HTO as an independent assay
+  cll[["HTO"]] <- CreateAssayObject(counts = cll_hto)
+  cll <- NormalizeData(cll, assay = "HTO", normalization.method = "CLR")
+  
+  # Demultiplex
+  cll <- HTODemux(cll, assay = "HTO", positive.quantile = 0.99)
+  
+  # Append to list of Seurat objects
+  cll_list[[lib]] <- cll
+}
+```
+
+# Visualize 
+
+We can visualize the results as ridge plots or heatmaps:
+
+```{r}
+ridge_l <- map(cll_list, function(cll) {
+  Idents(cll) <- "HTO_maxID"
+  RidgePlot(cll, assay = "HTO", features = rownames(cll[["HTO"]])[1:6], ncol = 3)
+})
+
+heatmap_l <- map(cll_list, function(cll) {
+  HTOHeatmap(cll, assay = "HTO", ncells = 5000)
+})
+
+# Save
+walk2(ridge_l, names(ridge_l), function(ridge, lib) {
+  ggsave(
+    filename = str_c("results/plots/", lib, "_hashtag_demux_ridge.pdf"),
+    plot = ridge, height = 9, 
+    width = 16
+  )
+})
+walk2(heatmap_l, names(heatmap_l), function(heat, lib) {
+  pdf(file = str_c("results/plots/", lib, "_hashtag_demux_heatmap.pdf"), height = 4, width = 7)
+  print(heat)
+  dev.off()
+})
+ridge_l
+heatmap_l
+```
+
+As we can see, there is a high signal-to-noise ratio for every HTO: the samples are easily identifible and there is no cross-contamination between hashtags. Overall, the number of cells is evenly distributed across time-points, which makes it easy to detect heterotypic doublets (doublets from different time-points). However, for the donor 1892, the cells assigned to 0h involve a larger fraction of the total, so we can expect an increased proportion of undetectable 0h-0h doublets. 
+
+Finally it is useful to get an overview of the number of singlets, doublets and negative cells per library:
+
+```{r}
+hto_levels <- c("Negative", "Singlet", "Doublet")
+cll_gg <- map(names(cll_list), function(id) {
+  cll_list[[id]]@meta.data %>% 
+    group_by(HTO_classification.global) %>% 
+    summarise(count = n()) %>% 
+    mutate(HTO_classification.global = factor(
+      HTO_classification.global, 
+      levels = hto_levels
+    )) %>% 
+    ggplot(aes(HTO_classification.global, count)) +
+      geom_col() +
+      geom_text(aes(label = count), 
+                position = position_dodge(width = 0.9), vjust = -0.25) +
+      labs(title = str_to_title(id), x = "", y = "number of cells") +
+      theme_bw() +
+      theme(axis.text.x = element_text(size = 11), 
+            plot.title = element_text(hjust = 0.5))
+})
+cll_gg
+```
+There is a low proportion of doublets and negative cells. Thus, we can conclude that we were able to successfully demultiplex cells and obtain high-quality data. 
+
+# Save demultiplexed Seurat object
+To merge the 4 Seurat objects into one we use the [`merge` command](https://satijalab.org/seurat/v3.0/merge_vignette.html):
+
+```{r}
+cll_merged <- merge(
+  cll_list$`1472_RT`, 
+  y = c(cll_list$`1472_4C`, cll_list$`1892_RT`, cll_list$`1892_4C`, cll_list$`1220_RT`),
+  add.cell.ids = libraries, 
+  project = "CLL_benchmarking"
+)
+
+# Recode and retain important variables
+cll_merged$donor <- str_remove(colnames(cll_merged), "_.*$")
+cll_merged$time <- str_remove(cll_merged$hash.ID, "....-..-")
+cll_merged$temperature <- cll_merged$hash.ID %>% 
+  str_remove("^....-") %>% 
+  str_remove("-.+h$")
+selection <- c("nCount_RNA", "nFeature_RNA", "HTO_classification", "hash.ID", 
+               "time", "donor", "temperature")
+cll_merged@meta.data <- cll_merged@meta.data[, selection]
+```
+
+Finally, we can save it as .RDS for future analysis:
+
+```{r}
+saveRDS(cll_merged, "results/R_objects/cll_Seurat_demultiplexed.rds")
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
+

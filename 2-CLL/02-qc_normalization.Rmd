@@ -1,0 +1,393 @@
+---
+title: "Quality Control & Normalization"
+author: "Ramon Massoni-Badosa"
+date: "15/7/2019"
+output: 
+  BiocStyle::html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, out.width = "100%", fig.align='center', 
+                      message=FALSE, warning = FALSE)
+options(width = 1200)
+```
+
+```{r}
+### KEY PARAMETERS
+library(BiocStyle)
+
+# Cell QC
+min_total_counts_1220 <- 750
+max_total_counts_1220 <- 5000
+min_total_counts_no_1220 <- 1200
+max_total_counts_no_1220 <- 10000
+min_total_genes_1220 <- 300
+max_total_genes_1220 <- 1500
+min_total_genes_no_1220 <- 300 
+max_total_genes_no_1220 <- 2000
+max_pct_mt_expression <- 30
+
+# Gene QC
+min_total_cells <- 15
+```
+
+# Introduction
+
+We are investigating the effect of sampling time on the single-cell transcriptomes of blood cells of CLL patients. In the previous notebook, we demultiplexed the cells and assigned them to their correct time. We refer to it for a full explanation of the data at hand.
+
+The objective of this notebook is to filter out poor-quality cells and genes and normalize the expression counts. 
+
+# Pre-processing
+
+## Package loading
+
+```{r}
+library(scater)
+library(scran)
+library(Seurat)
+library(ggpubr)
+library(tidyverse)
+```
+
+## Source script with functions
+
+```{r}
+source("bin/utils.R")
+```
+
+## Load data
+
+We load the demuliplexed `Seurat` object:
+
+```{r}
+cll_seu <- readRDS("results/R_objects/cll_Seurat_demultiplexed.rds")
+cll_seu <- subset(cll_seu, subset = hash.ID != "Doublet" & hash.ID != "Negative")
+
+# Define mitochondrial genes
+mt_genes <- str_detect(rownames(cll_seu), "^MT-")
+```
+
+# Cell QC
+
+## Calculate QC metrics
+
+There are 3 essential quality control metrics that will determine if we include or exclude a cell:
+
+- Library size (total UMI): broken cells or empty droplets will have very little RNA. Likewise, doublets will have too many total UMI. We aim to discard both options.
+- Number of detected genes: highly correlated with the former. Stressed cells will have an increased dropout rate, and therefore fewer detected genes.
+- Percentage of mitochondrial expression: apoptotic or lysed cells will possess a high mitochondrial expression. That is, if the cell had shears in its membrane, the cytoplasmic RNA might leak outwards, but the mtRNA can remain trapped inside the cell.
+
+The only metric missing is the mt expression:
+
+```{r}
+cll_seu[["percent_mt"]] <- PercentageFeatureSet(cll_seu, pattern = "^MT-")
+```
+
+## QC metric distribution across conditions
+
+A first important realization is that different conditions can have differences in QC metric distributions. For instance, if one donor was sequenced deeper than another, then the notion of 'poor-quality cell' between both based on QC metrics will differ. If that is the case, we will need to establish different thresholds for each donor/condition. 
+
+Let us inspect such distributions:
+
+```{r}
+cll_seu$time <- factor(cll_seu$time, levels = c("0h", "2h", "4h", "6h", "8h", "24h"))
+qc_colnames <- c("nCount_RNA", "nFeature_RNA", "percent_mt")
+qc_titles <- c("Library Size (total UMI)", "Number of detected genes", "% mitochondrial expression")
+qc_all_gg <- map2(qc_colnames, qc_titles, function(metric, title) {
+  cll_seu@meta.data %>% 
+  ggplot(aes_string("time", metric, fill = "temperature")) +
+     geom_boxplot() +
+     scale_y_log10() +
+     scale_fill_manual(values = c("#a5cded", "#FF7B02"), labels = c("4ºC", "RT")) +
+     facet_wrap(~donor) +
+     labs(x = "", y = title, fill = "") + 
+     theme_classic2()
+})
+qc_all_gg
+```
+
+Importantly, there are systematic differences in library size and cell coverage (# detected genes) between the donor 1220 and the other two (1472, 1892). Thus, we will use donor 1220-specific thresholds for all but mitochondrial expression. Finally, although there are differences between 4ºC and RT, the distributions show a large degree of overlapping, so we will analyse them together.
+
+## Joint distribution
+Another important exploratory analysis is the joint distribution between the 3 metrics. Specially, a high mitochondrial expression can also be present in metabolically active cells. Therefore, we need to assess how this covaries with total counts. If we find that most cells with large mitochondrial activity also have few genes/UMI, then we can be certain that they are of poor-quality:
+
+```{r}
+joint_qc_gg <- cll_seu@meta.data %>% 
+  ggplot(aes(nCount_RNA, nFeature_RNA, color = percent_mt)) +
+    geom_point(alpha = 0.5) +
+    scale_color_viridis_c() +
+    labs(x = qc_titles[1], y = qc_titles[2], color = qc_titles[3]) +
+    theme_classic()
+joint_qc_gg
+```
+
+Indeed, we see that cells with high mitochondrial activity are enriched in the region of low number of UMI and genes. Thus, we can filter them confidently. Noteworthy, there are some cells that are clear outliers in library size and cell coverage and most likely represent doublets.
+
+## Thresholds
+
+Now that we have a better appreciation for our data, we can proceed to decide on the thresholds for each metric. We will do so by plotting a histogram for each metric:
+
+### Library size
+
+```{r}
+cll_1220 <- subset(cll_seu, subset = donor == "1220")
+cll_without_1220 <- subset(cll_seu, subset = donor != "1220")
+hist_counts_gg1 <- map(list(cll_1220, cll_without_1220), function(seurat) {
+  plot_histogram_seurat(  
+  seurat, 
+  qc_metric = qc_colnames[1], 
+  limits = c(0, 20000),
+  title = qc_titles[1],
+  log_scale = FALSE
+  )
+})
+names(hist_counts_gg1) <- c("with 1220", "without 1220")
+hist_counts_gg1
+```
+
+As there is a long tail, we need more resolution to decide on the thresholds:
+
+```{r}
+hist_counts_gg2 <- map(list(cll_1220, cll_without_1220), function(seurat) {
+  plot_histogram_seurat(  
+  seurat, 
+  qc_metric = qc_colnames[1], 
+  limits = c(0, 3500),
+  title = qc_titles[1],
+  log_scale = FALSE
+  )
+})
+names(hist_counts_gg2) <- c("with 1220", "without 1220")
+hist_counts_gg2
+```
+
+In both cases we see a bimodal distribution, with the first peak representing poor-quality cells. We will retain cells that have at least `r min_total_counts_1220` counts for the 1220 donor and at least `r min_total_counts_1220` for the others. Likewise, we require less than `r max_total_counts_1220` and `r max_total_counts_no_1220` for 1220 and non-1220, respectively.
+
+```{r}
+hist_counts_gg3 <- map(list(cll_1220, cll_without_1220), function(seurat) {
+  plot_histogram_seurat(  
+  seurat, 
+  qc_metric = qc_colnames[1], 
+  limits = c(0, 20000),
+  title = qc_titles[1],
+  log_scale = TRUE
+  )
+})
+names(hist_counts_gg3) <- c("with 1220", "without 1220")
+hist_counts_gg3$`with 1220` +
+  geom_vline(xintercept = min_total_counts_1220, linetype = "dashed", color = "red") +
+  geom_vline(xintercept = max_total_counts_1220, linetype = "dashed", color = "red") 
+hist_counts_gg3$`without 1220` +
+  geom_vline(xintercept = min_total_counts_no_1220, linetype = "dashed", color = "red") +
+  geom_vline(xintercept = max_total_counts_no_1220, linetype = "dashed", color = "red") 
+```
+
+### Number of detected genes
+
+```{r}
+hist_n_genes_gg1 <- map(list(cll_1220, cll_without_1220), function(seurat) {
+  plot_histogram_seurat(  
+  seurat, 
+  qc_metric = qc_colnames[2], 
+  limits = c(0, 2500),
+  title = qc_titles[2],
+  log_scale = FALSE
+  )
+})
+names(hist_n_genes_gg1) <- c("with 1220", "without 1220")
+hist_n_genes_gg1
+```
+
+For 1220 the distribution is bimodal, so we can assume the first peak to be stressed cells. However, the second has 3 modes, with the 2nd and 3rd peak being potential subpopulations.
+
+We use the following thresholds
+
+```{r}
+hist_n_genes_gg1$`with 1220` +
+  geom_vline(xintercept = min_total_genes_1220, linetype = "dashed", color = "red") +
+  geom_vline(xintercept = max_total_genes_1220, linetype = "dashed", color = "red") 
+hist_n_genes_gg1$`without 1220` +
+  geom_vline(xintercept = min_total_genes_no_1220, linetype = "dashed", color = "red") +
+  geom_vline(xintercept = max_total_genes_no_1220, linetype = "dashed", color = "red") 
+```
+
+### Mitochondrial expression
+
+In this case, the distributions were homogeneous between the 3 donors, so we can have a single histogram:
+
+```{r}
+mt_hist <- plot_histogram_seurat(  
+  cll_seu, 
+  qc_metric = qc_colnames[3], 
+  limits = c(0, 100),
+  title = qc_titles[3],
+  log_scale = FALSE
+)
+mt_hist +
+  geom_vline(xintercept = max_pct_mt_expression, linetype = "dashed", color = "red")
+```
+
+Overall, we will consider as poor-quality any cell that satisfies any of the following conditions:
+
+* Library size: 1200: < `r min_total_counts_1220`, > `r max_total_counts_1220`; non-1200: < `r min_total_counts_no_1220`, > `r max_total_counts_no_1220`
+* Number of detected genes: 1200: < `r min_total_genes_1220`, > `r max_total_genes_1220`; non-1200: < `r min_total_genes_no_1220`, > `r max_total_genes_no_1220`
+* Mitochondrial expression: < `r max_pct_mt_expression`
+
+```{r}
+is_poor_quality <- 
+  (cll_seu$donor == "1220" & cll_seu$nCount_RNA < min_total_counts_1220) |
+  (cll_seu$donor == "1220" & cll_seu$nCount_RNA > max_total_counts_1220) |
+  (cll_seu$donor != "1220" & cll_seu$nCount_RNA < min_total_counts_no_1220) |
+  (cll_seu$donor != "1220" & cll_seu$nCount_RNA > max_total_counts_no_1220) |
+  (cll_seu$donor == "1220" & cll_seu$nFeature_RNA < min_total_genes_1220) |
+  (cll_seu$donor == "1220" & cll_seu$nFeature_RNA > max_total_genes_1220) |
+  (cll_seu$donor != "1220" & cll_seu$nFeature_RNA < min_total_genes_no_1220) |
+  (cll_seu$donor != "1220" & cll_seu$nFeature_RNA > max_total_genes_no_1220) |
+  cll_seu$percent_mt > max_pct_mt_expression
+table(is_poor_quality)
+```
+```{r}
+joint_qc_gg + 
+  geom_vline(xintercept = min_total_counts_no_1220, color = "red", linetype = "dashed") +
+  geom_vline(xintercept = max_total_counts_no_1220, color = "red", linetype = "dashed") +
+  geom_hline(yintercept = min_total_genes_no_1220, color = "red", linetype = "dashed") +
+  geom_hline(yintercept = max_total_genes_no_1220, color = "red", linetype = "dashed") 
+```
+
+
+## Distribution poor-quality cells across conditions
+
+Of note, we can compare the proportion of poor quality cells across conditions
+```{r}
+cll_seu$is_low_quality <- is_poor_quality
+poor_cond_gg <- cll_seu@meta.data %>% 
+  group_by(donor, temperature, time) %>% 
+  summarise(pct_poor_cells = mean(is_low_quality) * 100) %>% 
+  ggplot(aes(time, pct_poor_cells, fill = temperature)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~donor) +
+  scale_fill_manual("", values = c("#a5cded", "#ed9121"),
+                    labels = c("4ºC", "18ºC")) +
+  labs(x = "", y = "% poor-quality cells", color = "") +
+  theme_classic2() + 
+  theme(axis.title.y = element_text(face = "bold", size = 10))
+poor_cond_gg
+```
+
+We observe that, in general, 4ºC cells have a lower quality than those at RT.
+
+## Cell filtering
+In light of the above, we will discard `r table(is_poor_quality)` cells:
+
+```{r}
+cll_seu <- subset(cll_seu, subset = is_low_quality == FALSE)
+cll_seu
+```
+
+# Gene QC
+
+Let us compute the number of cells that each gene has at least 1 UMI:
+
+```{r}
+n_cells <- rowSums(as.matrix(cll_seu[["RNA"]]@counts) > 0)
+gene_qc_gg <- n_cells %>% 
+  as.data.frame() %>% 
+  ggplot(aes(n_cells)) + 
+    geom_histogram(bins = 100, alpha = 0.75) +
+    scale_x_log10("Number of cells") +
+    theme_bw() 
+gene_qc_gg
+```
+
+We see two peaks, the first one of which corresponds to lowly expressed genes. As explained in [Luecken MD et al.](https://www.embopress.org/doi/pdf/10.15252/msb.20188746): "a guideline to setting this threshold is to use the minimum cell cluster size that is of interest and leaving some leeway for dropout effects". As we will not rely on clusters that have fewer than 15 cells, we will use it as a filter:
+
+```{r}
+gene_qc_gg +
+  geom_vline(xintercept = min_total_cells, color = "red", linetype = "dashed")
+cll_sce <- as.SingleCellExperiment(cll_seu)
+cll_sce <- cll_sce[n_cells > 15, ]
+cll_sce
+```
+
+### Identify highly expressed genes
+As a validation, let us check whether the highest expressed genes are housekeeping genes like ACTB:
+
+```{r}
+row_data_frame <- data.frame(symbol = rownames(cll_sce))
+rownames(row_data_frame) <- rownames(cll_sce)
+rowData(cll_sce) <- row_data_frame
+cll_sce <- calculateQCMetrics(cll_sce)
+plotHighestExprs(cll_sce, feature_names_to_plot = "symbol")
+```
+
+# Normalization
+To confidently compare gene expression between cells, we need to correct for two biases:
+
+- Differences in library size: if one cell has more total counts than another due to sampling effects, genes that are equally expressed will show up as upregulated.
+- Between-sample systematic biases: if two conditions/donors were sequenced at different depths or in different batches, there might be compositional biases between conditions that yield a systematic up- or down-regulation.
+
+To correct for both, we will use the [`scran` package](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-016-0947-7)  which according to both a [recent](https://www.nature.com/articles/nmeth.4292) and an [old](https://www.biorxiv.org/content/10.1101/583013v2.full) review is the most robust method for scRNA-seq data normalization:
+
+```{r}
+# Note: this needs to be run, as this is the best normalization method (explained above). However, it needs to be run on the cluster which, does not work at the moment. Thus, we run scran without quickcluster.
+# clusters <- quickCluster(
+#   cll_sce, 
+#   use.ranks = FALSE, 
+#   block = factor(cll_sce$donor), 
+#   BPPARAM = MulticoreParam(4),
+#   block.BPPARAM = MulticoreParam(4)
+# )
+# cll_sce <- computeSumFactors(cll_sce, cluster = clusters, BPPARAM =  MulticoreParam(4))
+# summary(sizeFactors(cll_sce))
+# cll_sce <- normalize(cll_sce)
+# assays(cll_sce)
+# logcounts(cll_sce)[1:6, 1:6]
+# plot(sizeFactors(cll_sce) ~ cll_sce$total_counts)
+# saveRDS(object = cll_sce, file = "results//R_objects/cll_seurat_filtered_to_normalize.rds")
+cll_sce <- computeSumFactors(cll_sce)
+summary(sizeFactors(cll_sce))
+assays(cll_sce)
+logcounts(cll_sce)[1:6, 1:6]
+```
+
+Let us assess if the size factors correlate with the library size:
+
+```{r}
+size_fact_df <- data.frame(
+  lib_size = cll_sce$nCount_RNA, 
+  size_fact = sizeFactors(cll_sce),
+  donor = cll_sce$donor
+)
+ggplot(size_fact_df, aes(lib_size, size_fact, color = donor)) +
+  geom_point() +
+  labs(x = "Library Size (total UMI)", y = "Scran Size Factors") +
+  theme_classic2()
+lm_size_fact <- lm(size_fact ~ lib_size, data = size_fact_df)
+summary(lm_size_fact)
+```
+
+As we can see, 93.36% of the variation in scran's size factors is explained by the library size, so we can conclude that there is a strong positive correlation between both. Moreover, the remaining variation (scatter along the regression line) is explained by the different donor. As we saw above, donors 1472 and 1892 were deeper sequenced than 1220. All in all, this validates that scran is normalizing by the two major biases explained above.
+
+# Save Seurat object
+
+Finally, we can convert it back to seurat and save it as a compressed .RDS file for future analysis:
+
+
+```{r}
+cll_seu <- as.Seurat(cll_sce)
+saveRDS(cll_seu, "results/R_objects/cll_seurat_filtered_normalized.rds")
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
+
+
+
+
+

@@ -1,0 +1,157 @@
+---
+title: "CLL storage adjustment"
+author: "Ramon Massoni-Badosa"
+date: "10/21/2019"
+output: 
+  BiocStyle::html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, out.width = "100%", fig.align='center', 
+                      message=FALSE, warning = FALSE)
+options(width = 1200)
+```
+
+# Introduction
+The objective of this notebook is to assess if storing blood samples at 4ºC before cryopreservation yields better single-cell transcriptomes than storing them at room temperature (RT).
+
+# Pre-processing
+
+## Package loading
+
+```{r}
+library(Seurat)
+library(ggpubr)
+library(kBET)
+library(ggrepel)
+library(viridis)
+library(pheatmap)
+library(tidyverse)
+```
+
+## Source script with functions
+
+```{r}
+source("bin/utils.R")
+```
+
+## Load data
+We dispose of a demultiplexed, filtered, normalized and annotated Seurat object that contains the transcriptome and metadata of >30,000 Chronic Lymphocytic Leukemia (CLL) cells from two donors (male/female) that were kept at varying times at RT (0h, 2h, 8h, 24h, 48h).
+
+```{r}
+cll <- readRDS("results/R_objects/cll_seurat_annotated.rds")
+```
+
+# Visualize mixability
+
+```{r}
+Idents(cll) <- "donor"
+cll_sub <- subset(cll, idents = c("1472", "1892"))
+cll_sub <- pre_process_seurat(cll_sub)
+cll_sub$temperature[cll_sub$time == "0h"] <- "fresh"
+cll_sub$temperature[cll_sub$temperature == "4C"] <- "4ºC"
+cll_sub$temperature <- factor(cll_sub$temperature, levels = c("fresh", "RT", "4ºC"))
+Idents(cll_sub) <- "temperature"
+
+# UMAP 
+umap_temperature <- DimPlot(
+  cll_sub, 
+  reduction = "umap", 
+  cols = c("#999999", "darkorange1", "#a5cded")
+)
+umap_temperature
+saveRDS(umap_temperature, "results/R_objects/ggplots/umap_4C_CLL.rds")
+
+# tSNE
+cll_sub <- RunTSNE(cll_sub, reduction = "pca", dims = 1:15)
+tsne_temperature <- DimPlot(
+  cll_sub, 
+  reduction = "tsne", 
+  cols = c("#999999", "darkorange1", "#a5cded")
+)
+tsne_temperature
+saveRDS(tsne_temperature, "results/R_objects/ggplots/tsne_4C_CLL.rds")
+```
+
+# Quantify mixability (kBET)
+
+```{r}
+temperatures <- c("RT", "4ºC")
+acceptance_rate_dbl <- purrr::map_dbl(temperatures, function(temp) {
+  seurat_sub <- subset(cll_sub, idents = c("fresh", temp))
+  seurat_sub$is_biased <- ifelse(seurat_sub$temperature == "fresh", FALSE, TRUE)
+  mat <- as.matrix(seurat_sub@reductions$umap@cell.embeddings)
+  batch <- seurat_sub$is_biased
+  batch_estimate <- kBET(mat, batch = batch, verbose = TRUE, heuristic = FALSE, testSize = 50)
+  batch_results <- batch_estimate$results
+  batch_results <- batch_results %>% 
+    mutate(cell_type = seurat_sub$cell_type,
+           time = seurat_sub$time) %>% 
+    filter(tested == 1) %>% 
+    summarise(acceptance_rate = mean(kBET.pvalue.test > 0.05) * 100)
+  batch_results$acceptance_rate
+})
+
+acceptance_rate_df <- data.frame(
+  temperature = temperatures, 
+  acceptance_rate = acceptance_rate_dbl
+)
+
+acceptance_rate_gg <- acceptance_rate_df %>% 
+  mutate(temperature = factor(temperature, levels = c("RT", "4ºC"))) %>% 
+  ggplot(aes(temperature, acceptance_rate, fill = temperature)) +
+    geom_col(position = "dodge") +
+    scale_y_continuous(limits = c(0, 20)) +
+    scale_fill_manual(values = c("darkorange1", "#a5cded")) +
+    labs(x = "", y = "kBET (acceptance rate)", fill = "") +
+    theme_classic() +
+    theme(axis.text = element_text(size = 11), 
+          axis.title.y = element_text(size = 13), 
+          legend.text = element_text(size = 11))
+acceptance_rate_gg
+saveRDS(
+  acceptance_rate_gg, 
+  "results/R_objects/ggplots/barplot_acceptance_rate_storage_cll.rds"
+)
+```
+
+# Differential Expression Analysis
+
+```{r}
+Idents(cll_sub) <- "temperature"
+cll_sub2 <- subset(cll_sub, idents = c("fresh", "4ºC"))
+dea <- FindMarkers(cll_sub2, ident.1 = "4ºC", test.use = "wilcox")
+dea <- rownames_to_column(dea, var = "gene")
+dea <- dea %>%
+  mutate(log10_pvalue = -1 * log10(p_val_adj), 
+         direction = ifelse(avg_logFC > 0, "up-regulated", "down-regulated")) %>%
+  mutate(direction = factor(direction, levels = c("up-regulated", "down-regulated"))) %>% 
+  arrange(direction) %>% 
+  group_by(direction) %>% 
+  arrange(log10_pvalue) %>% 
+  ungroup()
+dea <- rbind(dea[dea$direction == "down-regulated", ], dea[dea$direction == "up-regulated", ])
+dea$gene <- factor(dea$gene, levels = dea$gene)
+dea_gg <- dea %>% 
+  ggplot(aes(gene, log10_pvalue, color = direction)) +
+    geom_segment(aes(x = gene, xend = gene, y = 0, yend = log10_pvalue)) +
+    geom_point() +
+    scale_color_manual("", values = c("firebrick3", "dodgerblue3")) +
+    labs(x = "", y = "-log10 (p-value)", color = "") +
+    theme_light() +
+    coord_flip()
+dea_gg
+saveRDS(dea_gg, "results/R_objects/ggplots/lollipop_plot_4ºC_cll.rds")
+```
+
+# Session Information
+
+```{r}
+sessionInfo()
+```
+
+
+

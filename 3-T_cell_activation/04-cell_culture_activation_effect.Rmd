@@ -1,0 +1,237 @@
+---
+title: "Cell Culture and Activation"
+author: "Ramon Massoni-Badosa"
+date: "10/17/2019"
+output: 
+  BiocStyle::html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, out.width = "100%", fig.align='center', 
+                      message=FALSE, warning = FALSE)
+options(width = 1200)
+```
+
+# Introduction
+The objective of this notebook is to elucidate if culturing and activating PBMC after thawing them removes the technical artifacts introduced by sampling time.
+
+# Pre-processing
+
+## Package loading
+
+```{r}
+library(scater)
+library(scran)
+library(Seurat)
+library(ggpubr)
+library(kBET)
+library(cluster)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(viridis)
+library(tidyverse)
+```
+
+## Source script with functions
+
+```{r}
+source("bin/utils.R")
+```
+
+## Load data
+
+```{r}
+t_act_l <- readRDS("results/R_objects/t_act_Seurat_list_annotated")
+dea_list <- readRDS("../2-CLL/results/R_objects/dea_results_per_patient.rds")
+```
+
+## Merge Seurat object
+
+```{r}
+t_act <- merge(
+  x = t_act_l$`0M`, 
+  y = c(t_act_l$`0F`, t_act_l$`2M` ,t_act_l$`2F`), 
+  add.cell.ids = c("0M", "0F", "2M", "2F")
+)
+t_act <- pre_process_seurat(t_act)
+```
+
+# Effect Cell Culture
+
+```{r}
+t_act_l <- purrr::map(t_act_l, RunTSNE, reduction = "pca", dims = 1:15)
+t_act_l <- purrr::map(t_act_l, function(seurat) {
+  seurat$time <- factor(seurat$time, levels = c("0h", "8h", "24h"))
+  Idents(seurat) <- "time"
+  seurat
+})
+t_act_umaps <- purrr::map(t_act_l, function(seurat) {
+  DimPlot(seurat, reduction = "umap", cols = c("#999999", "#58315E", "#D36A55"))
+})
+saveRDS(t_act_umaps, "results/R_objects/ggplots/umaps_t_activation.rds")
+t_act_tsnes <- purrr::map(t_act_l, function(seurat) {
+  DimPlot(seurat, reduction = "tsne", cols = c("#999999", "#58315E", "#D36A55"))
+})
+saveRDS(t_act_tsnes, "results/R_objects/ggplots/tsnes_t_activation.rds")
+male_arranged <- ggarrange(
+  plotlist = t_act_umaps[c("0M", "2M")], 
+  nrow = 1, 
+  ncol = 2, 
+  common.legend = TRUE, 
+  legend = "right"
+)
+male_arranged
+female_arranged <- ggarrange(
+  plotlist = t_act_umaps[c("0F", "2F")], 
+  nrow = 1, 
+  ncol = 2, 
+  common.legend = TRUE, 
+  legend = "right"
+)
+female_arranged
+```
+
+Interestingly, we can observe how culturing and activating PBMC from the male donor for two days (day 2) removed the cold-shock stress response, because we observe a high intermixing between time-points as compared to the control (not-cultured, day 0). 
+On the contrary, we do not observe this for the female donor, as in the cultured PBMC we still observe the effect of time. This donor is invalidated by the fact that the control dataset (not cultured PBMC, day 0) does not display the typical gradient of time that we have observed multiple times before. We could think that the samples are mislabeled, so Day 0 and 2 could be interchanged. However, the fact that in cultured dataset we do not detect monocytes (similar to the male donor), rules out this scenario.
+All in all, we exclude the female dataset; whilst the male dataset points to promising results. We will need to repeat this same experiment with two more donors to see if the observation that culturing removes the technical artifact introduced by time is reproducible.
+
+## kBET
+The former analysis provides qualitative information about the intermixing between time-points. To get a quantitative view, we will use [kBET](https://www.nature.com/articles/s41592-018-0254-1):
+
+```{r}
+acceptance_rates_l <- purrr::map(t_act_l, function(seurat) {
+  seurat$is_biased <- ifelse(seurat$time == "0h", FALSE, TRUE)
+  seurat <- pre_process_seurat(seurat)
+  DimPlot(seurat, reduction = "umap")
+  mat <- as.matrix(seurat@reductions$umap@cell.embeddings)
+  batch <- seurat$is_biased
+  batch_estimate <- kBET(mat, batch = batch, verbose = TRUE, heuristic = FALSE, testSize = 50)
+  batch_results <- batch_estimate$results
+  batch_results <- batch_results %>% 
+    dplyr::mutate(cell_type = seurat$cell_type) %>% 
+    dplyr::filter(tested == 1) %>% 
+    dplyr::group_by(cell_type) %>%
+    dplyr::summarise(acceptance_rate = mean(kBET.pvalue.test > 0.05) * 100)
+  batch_results
+})
+acceptance_rates_l$`0M` <- acceptance_rates_l$`0M` %>% 
+  dplyr::filter(cell_type %in% c("B", "CD4 T", "Cytotoxic", "Monocyte")) # DC not enough cells
+acceptance_rates_m <- bind_rows(acceptance_rates_l[c("0M", "2M")], .id = "day")
+acceptance_rates_m$cell_type[acceptance_rates_m$cell_type == "CD4 T"] <- "CD4 T-cell"
+acceptance_rates_m$cell_type[acceptance_rates_m$cell_type == "B"] <- "B-cell"
+acc_rate_m_gg <- acceptance_rates_m %>% 
+  dplyr::mutate(cell_type = factor(cell_type, levels = c("CD4 T-cell", "Cytotoxic", "B-cell", "Monocyte", "Cycling"))) %>% 
+  dplyr::mutate(day = ifelse(day == "0M", "Original", "Cultured")) %>% 
+  dplyr::mutate(day = factor(day, levels = c("Original", "Cultured"))) %>% 
+  ggplot(aes(cell_type, acceptance_rate)) +
+    geom_col(color = "black") +
+    scale_y_continuous(limits = c(0, 100)) +
+    labs(x = "", y = "kBET (acceptance rate)") +
+    facet_grid(. ~ day, scales = "free_x") +
+    theme_classic()
+acc_rate_m_gg
+saveRDS(acc_rate_m_gg, "results/R_objects/ggplots/barplot_kBET_t_act.rds")
+saveRDS(t_act_l$`2M`, "results/R_objects/t_act_seurat_2M.rds")
+
+# day <- c("Original", "Cultured")
+# acceptance_rates_m <- data.frame(
+#   day = factor(day, levels = day),
+#   acceptance_rate = acceptance_rates_l[c("0M", "2M")]
+# )
+# acc_rate_m_gg <- ggplot(acceptance_rates_m, aes(day, acceptance_rate)) +
+#   geom_col(color = "black") +
+#   scale_y_continuous(limits = c(0, 100)) +
+#   labs(x = "", y = "kBET (acceptance rate)") +
+#   theme_classic() 
+# acc_rate_m_gg  
+# acceptance_rates_f <- bind_rows(acceptance_rates_l[c("0F", "2F")], .id = "day")
+# acceptance_rates_f$day <- c("Day 0", "Day 2")
+# acc_rate_f_gg <- ggplot(acceptance_rates_f, aes(day, acceptance_rate)) +
+#   geom_col(color = "black") +
+#   scale_y_continuous(limits = c(0, 100)) +
+#   labs(x = "", y = "kBET (acceptance rate)") +
+#   theme_classic() 
+# saveRDS(acc_rate_m_gg, "results/R_objects/ggplots/barplot_kBET_t_act.rds")
+# 
+# acceptance_rates_gg <- purrr::map(acceptance_rates_l, function(df) {
+#   ggplot(df, aes(fct_reorder(cell_type, acceptance_rate), acceptance_rate)) +
+#     geom_col(color = "black") +
+#     scale_y_continuous(limits = c(0, 100)) +
+#     labs(x = "", y = "kBET (acceptance rate)") +
+#     theme_classic() +
+#     coord_flip()
+# })
+# DimPlot(object = t_act_l$`2M`, reduction = "umap")
+```
+
+
+# Cold-shock Score
+
+```{r}
+# Find cold shock signature
+cold_shock_signature <- readRDS("../1-PBMC/results/R_objects/cold_shock_signature_up.rds")
+
+# Compute cold shock score
+t_act_l <- purrr::map(t_act_l, function(seurat) {
+  seurat <- AddModuleScore(
+    object = seurat, 
+    features = list(cold_shock_signature), 
+    name = "cold_shock_score"
+  )
+  seurat
+})
+
+# Visualize cold-shock score
+cold_shock_df <- t_act_l[c("0M", "2M")] %>% 
+  map(~ .x@meta.data) %>%
+  map(~ .x %>% dplyr::select("day", "time", "cold_shock_score1")) %>% 
+  bind_rows(.id = "condition") %>% 
+  mutate(condition = ifelse(condition == "0M", "Original", "Cultured")) %>% 
+  mutate(condition = factor(condition, levels = c("Original", "Cultured")))
+cold_shock_violin <- cold_shock_df %>% 
+  ggplot(aes(time, cold_shock_score1, fill = condition)) +
+    geom_boxplot(outlier.size = 0.1) +
+    labs(x = "", y = "Cold-Shock Score", fill = "") +
+    scale_fill_manual(values = c("#3374A1", "#E1812C")) +
+    theme_classic()
+cold_shock_violin
+saveRDS(cold_shock_violin, "results/R_objects/ggplots/boxplot_cold_shock_t_act.rds")
+
+
+
+
+# # Visualize cold-shock-score
+# violins_gg <- purrr::map(t_act_l, function(seurat) {
+#   violin_cold_shock_score <- VlnPlot(
+#     seurat, 
+#     features = "cold_shock_score1", 
+#     pt.size = 0, 
+#     group.by = "time",
+#     cols = c("#999999", "#58315E", "#D36A55")
+#   )
+#   violin_cold_shock_score
+# })
+# male_violins <- ggarrange(
+#   plotlist = violins_gg[c("0M", "2M")], 
+#   nrow = 1, 
+#   ncol = 2, 
+#   common.legend = TRUE, 
+#   legend = "right"
+# )
+# male_violins
+# female_violins <- ggarrange(
+#   plotlist = violins_gg[c("0F", "2F")], 
+#   nrow = 1, 
+#   ncol = 2, 
+#   common.legend = TRUE, 
+#   legend = "right"
+# )
+# female_violins
+```
+
+
+
+

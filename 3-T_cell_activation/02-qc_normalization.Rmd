@@ -1,0 +1,567 @@
+---
+title: "QC & Normalization - T cell activation"
+author: "Ramon Massoni-Badosa"
+date: "10/7/2019"
+output: 
+  BiocStyle::html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, out.width = "100%", fig.align='center', 
+                      message=FALSE, warning = FALSE)
+options(width = 1200)
+```
+
+
+```{r}
+### KEY PARAMETERS
+library(BiocStyle)
+
+# Cell QC - Day 0
+min_total_counts_0 <- 750
+max_total_counts_0 <- 7500
+min_total_genes_0 <- 325
+max_total_genes_0 <- 2000
+max_pct_mt_expression_0 <- 17.5
+  
+# Cell QC - Day 2
+min_total_counts_2 <- 650
+max_total_counts_2 <- 15000
+min_total_genes_2 <- 325
+max_total_genes_2 <- 4000
+max_pct_mt_expression_2 <- 17.5
+
+# Cell QC - Day 0 (rep2)
+min_total_counts_0_rep2 <- 1250
+max_total_counts_0_rep2 <- 10000
+min_total_genes_0_rep2 <- 325
+max_total_genes_0_rep2 <- 4000
+max_pct_mt_expression_0_rep2 <- 25
+  
+# Cell QC - Day 1 (rep2)
+min_total_counts_1_rep2 <- 800
+max_total_counts_1_rep2 <- 15000
+min_total_genes_1_rep2 <- 325
+max_total_genes_1_rep2 <- 4000
+max_pct_mt_expression_1_rep2 <-17.5
+
+# Gene QC
+min_total_cells <- 10
+```
+
+# Introduction
+We are investigating whether culturing cells after thawing them eliminates the bias introduced by sampling time. The objective of this notebook is to filter out poor-quality cells and genes and normalize gene expression counts.
+
+# Pre-processing
+
+## Package loading
+
+```{r}
+library(scater)
+library(scran)
+library(Seurat)
+library(ggpubr)
+library(ggridges)
+library(DoubletFinder)
+library(tidyverse)
+```
+
+
+## Source script with functions
+
+```{r}
+source("bin/utils.R")
+```
+
+## Load data
+
+We load the demuliplexed `Seurat` objects:
+
+```{r}
+t_act_l <- readRDS("results/R_objects/t_act_Seurat_list_demultiplexed.rds")
+```
+
+To increase our resolution, we will already rule out the cells that were labeled as "Negative". For now, we will keep the detected Doublets as we will use them as ground-truth in the doublet detection step below:
+
+```{r}
+t_act_l <- map(t_act_l, function(seurat) {
+  seurat <- subset(seurat, subset = hash.ID != "Negative")
+})
+```
+
+# Cell QC
+
+## Calculate QC metrics
+
+There are 3 essential quality control metrics that will determine if we include or exclude a cell:
+
+- Library size (total UMI): broken cells or empty droplets will have very little RNA. Likewise, doublets will have too many total UMI. We aim to discard both options.
+- Number of detected genes: highly correlated with the former. Stressed cells will have an increased dropout rate, and therefore fewer detected genes.
+- Percentage of mitochondrial expression: apoptotic or lysed cells will possess a high mitochondrial expression. That is, if the cell had shears in its membrane, the cytoplasmic RNA might leak outwards, but the mtRNA can remain trapped inside the cell.
+
+The only metric missing is the mt expression:
+
+```{r}
+t_act_l <- map(t_act_l, function(seurat) {
+  seurat[["percent_mt"]] <- PercentageFeatureSet(seurat, pattern = "^MT-")
+  seurat
+})
+```
+
+## QC metric distribution across conditions
+A first important realization is that different libraries can have differences in QC metric distributions. For instance, if one library was sequenced deeper than another, then the notion of 'poor-quality cell' between both based on QC metrics will differ. If that is the case, we will need to establish different thresholds for each condition. 
+
+Let us inspect such distributions:
+
+```{r}
+vars <- c("nFeature_RNA", "percent_mt")
+y_titles <- c("# detected genes", "% mitochondrial expression")
+qc_distr_gg <- map2(vars, y_titles, function(var, y_title) {
+  t_act_l %>% 
+    map(~ .x@meta.data) %>% 
+    bind_rows(.id = "day") %>% 
+    mutate(day = str_remove(day, "Tcell_activation_")) %>% 
+    separate(col = "hash.ID", into = c("donor", "time", "temperature", "day"), sep = "-") %>% 
+    filter(!is.na(time)) %>% 
+    mutate(time = factor(time, levels = c("0h", "8h", "24h"))) %>% 
+    ggplot(aes_string("time", var, fill = "time")) +
+      geom_boxplot() +
+      facet_grid(day ~ donor) +
+      labs(x = "", y = y_title) +
+      theme_bw() +
+      theme(legend.position = "none")
+})
+qc_distr_gg
+```
+
+## Joint distribution
+Another important exploratory analysis is the joint distribution between the 3 metrics. Specially, a high mitochondrial expression can also be present in metabolically active cells. Therefore, we need to assess how this covaries with total counts. If we find that most cells with large mitochondrial activity also have few genes/UMI, then we can be certain that they are of poor-quality:
+
+```{r}
+qc_titles <- c("Library Size (total UMI)", "Number of detected genes", "% mitochondrial expression")
+joint_qc <- map(t_act_l, function(seurat) {
+  joint_qc_gg <- seurat@meta.data %>% 
+    ggplot(aes(nCount_RNA, nFeature_RNA, color = percent_mt)) +
+      geom_point(alpha = 0.5) +
+      scale_color_viridis_c() +
+      labs(x = qc_titles[1], y = qc_titles[2], color = qc_titles[3]) +
+      theme_classic()
+  joint_qc_gg
+})
+joint_qc
+```
+
+
+## Thresholds
+Now that we have a better appreciation for our data, we can proceed to decide on the thresholds for each metric. We will do so by plotting a histogram for each metric:
+
+### Library size
+
+```{r}
+qc_colnames <- c("nCount_RNA", "nFeature_RNA", "percent_mt")
+hist_counts_gg1 <- map2(t_act_l, c(10000, 20000, 15000, 15000), function(seurat, x_max) {
+  hist_counts_gg1 <- plot_histogram_seurat(  
+    seurat, 
+    qc_metric = qc_colnames[1], 
+    limits = c(0, x_max),
+    title = qc_titles[1],
+    log_scale = FALSE
+  )
+  hist_counts_gg1
+})
+hist_counts_gg1
+```
+
+We see a right-skewed distribution, which likely encapsulates the increased transcription after T-cell activation. We can increase the resolution:
+
+```{r}
+hist_counts_gg2 <- map(t_act_l, function(seurat) {
+  hist_counts_gg2 <- plot_histogram_seurat(  
+    seurat, 
+    qc_metric = qc_colnames[1], 
+    limits = c(0, 4000),
+    title = qc_titles[1],
+    log_scale = FALSE
+  )
+  hist_counts_gg2
+})
+hist_counts_gg2
+```
+
+For day 0 we will threshold at `r min_total_counts_0`, whilst for day 2 we will threshold at `r min_total_counts_2`. Moreover we will require a maximum of `r max_total_counts_0` and `r max_total_counts_2` for days 0 and 2, respectively:
+
+```{r}
+iterable <- list(
+  hist_counts_gg2, 
+  c(min_total_counts_0, min_total_counts_2, min_total_counts_0_rep2, min_total_counts_1_rep2),
+  c(max_total_counts_0, max_total_counts_2, max_total_counts_0_rep2, max_total_counts_1_rep2)
+)
+hist_counts_gg3 <- pmap(iterable, function(hist, min_counts, max_counts) {
+  hist +
+    geom_vline(xintercept = min_counts, linetype = "dashed", color = "red") +
+    geom_vline(xintercept = max_counts, linetype = "dashed", color = "red") 
+})
+hist_counts_gg3
+```
+
+### Number of detected genes
+
+```{r}
+hist_n_genes_gg1 <- map2(t_act_l, c(4000, 8000, 6000, 6000), function(seurat, x_max) {  
+  plot_histogram_seurat(
+    seurat, 
+    qc_metric = qc_colnames[2], 
+    limits = c(0, x_max),
+    title = qc_titles[2],
+    log_scale = FALSE
+  )
+})
+hist_n_genes_gg1
+```
+
+
+For day 0 we see two modes. They likely respresent two subpopulations, so we will choose to be permissive and filter out cells with less than `r min_total_genes_0` or more than 2000. On the other hand, day 0 possesses a large right tail. We rule out cells with less than `r min_total_genes_2`or more than `r max_total_genes_2`:
+
+```{r}
+iterable <- list(
+  hist_n_genes_gg1, 
+  c(min_total_genes_0, min_total_genes_2, min_total_genes_0_rep2, min_total_genes_1_rep2),
+  c(max_total_genes_0, max_total_genes_2, max_total_genes_0_rep2, max_total_genes_1_rep2)
+)
+hist_n_genes_gg2 <- pmap(iterable, function(hist, min_counts, max_counts) {
+  hist +
+    geom_vline(xintercept = min_counts, linetype = "dashed", color = "red") +
+    geom_vline(xintercept = max_counts, linetype = "dashed", color = "red") 
+})
+hist_n_genes_gg2
+```
+
+
+### Mitochondrial expression
+
+```{r}
+mt_hists <- map(t_act_l, function(seurat) {
+  mt_hist <- plot_histogram_seurat(  
+    seurat, 
+    qc_metric = qc_colnames[3], 
+    limits = c(0, 100),
+    title = qc_titles[3],
+    log_scale = FALSE
+  )
+  mt_hist
+})
+mt_hists
+```
+
+We see a long tail of cells with high mitochondrial expression. As we saw that high % mt expression correlated with low number of genes, we will visually follow the normal distribution and threshold for day 0 and 2 at `r max_pct_mt_expression_0` and `r max_pct_mt_expression_2`, respectively:
+
+```{r}
+iterable <- c(max_pct_mt_expression_0, max_pct_mt_expression_2, max_pct_mt_expression_0_rep2, max_pct_mt_expression_1_rep2)
+mt_hists <- map2(mt_hists, iterable, function(p, x_max) {
+  p +
+    geom_vline(xintercept = x_max, linetype = "dashed", color = "red")
+})
+mt_hists
+```
+
+
+Overall, we will consider as poor-quality any cell that satisfies any of the following conditions:
+
+DAY 0 (rep1):
+
+* Library size: < `r min_total_counts_0`, > `r max_total_counts_0`
+* Number of detected genes: < `r min_total_genes_0`, > `r max_total_genes_0` max_total_genes_no_1220`
+* Mitochondrial expression: < `r max_pct_mt_expression_0`
+
+```{r}
+is_poor_quality_0 <- 
+  t_act_l$Tcell_activation_day0$nCount_RNA < min_total_counts_0 |
+  t_act_l$Tcell_activation_day0$nCount_RNA > max_total_counts_0 |
+  t_act_l$Tcell_activation_day0$nFeature_RNA < min_total_genes_0 |
+  t_act_l$Tcell_activation_day0$nFeature_RNA > max_total_genes_0 |
+  t_act_l$Tcell_activation_day0$percent_mt > max_pct_mt_expression_0
+table(is_poor_quality_0)
+```
+
+DAY 2 (rep1):
+
+* Library size: < `r min_total_counts_2`, > `r max_total_counts_2`
+* Number of detected genes: < `r min_total_genes_2`, > `r max_total_genes_2` max_total_genes_no_1220`
+* Mitochondrial expression: < `r max_pct_mt_expression_2`
+
+```{r}
+is_poor_quality_2 <- 
+  t_act_l$Tcell_activation_day2$nCount_RNA < min_total_counts_2 |
+  t_act_l$Tcell_activation_day2$nCount_RNA > max_total_counts_2 |
+  t_act_l$Tcell_activation_day2$nFeature_RNA < min_total_genes_2 |
+  t_act_l$Tcell_activation_day2$nFeature_RNA > max_total_genes_2 |
+  t_act_l$Tcell_activation_day2$percent_mt > max_pct_mt_expression_2
+table(is_poor_quality_2)
+```
+
+DAY 0 (rep2):
+
+* Library size: < `r min_total_counts_0_rep2`, > `r max_total_counts_0_rep2`
+* Number of detected genes: < `r min_total_genes_0_rep2`, > `r max_total_genes_0_rep2`
+* Mitochondrial expression: < `r max_pct_mt_expression_0_rep2`
+
+```{r}
+is_poor_quality_0_rep2 <- 
+  t_act_l$Tcell_activation_day0_rep2$nCount_RNA < min_total_counts_0_rep2 |
+  t_act_l$Tcell_activation_day0_rep2$nCount_RNA > max_total_counts_0_rep2 |
+  t_act_l$Tcell_activation_day0_rep2$nFeature_RNA < min_total_genes_0_rep2 |
+  t_act_l$Tcell_activation_day0_rep2$nFeature_RNA > max_total_genes_0_rep2 |
+  t_act_l$Tcell_activation_day0_rep2$percent_mt > max_pct_mt_expression_0_rep2
+table(is_poor_quality_0_rep2)
+```
+
+DAY 1 (rep2):
+
+* Library size: < `r min_total_counts_1_rep2`, > `r max_total_counts_1_rep2`
+* Number of detected genes: < `r min_total_genes_1_rep2`, > `r max_total_genes_1_rep2` max_total_genes_no_1220`
+* Mitochondrial expression: < `r max_pct_mt_expression_1_rep2`
+
+```{r}
+is_poor_quality_1_rep2 <- 
+  t_act_l$Tcell_activation_day1_rep2$nCount_RNA < min_total_counts_1_rep2 |
+  t_act_l$Tcell_activation_day1_rep2$nCount_RNA > max_total_counts_1_rep2 |
+  t_act_l$Tcell_activation_day1_rep2$nFeature_RNA < min_total_genes_1_rep2 |
+  t_act_l$Tcell_activation_day1_rep2$nFeature_RNA > max_total_genes_1_rep2 |
+  t_act_l$Tcell_activation_day1_rep2$percent_mt > max_pct_mt_expression_1_rep2
+table(is_poor_quality_1_rep2)
+```
+
+## Distribution poor-quality cells across conditions
+
+Of note, we can compare the proportion of poor quality cells across donors:
+
+```{r}
+t_act_l$Tcell_activation_day0$is_low_quality <- is_poor_quality_0
+t_act_l$Tcell_activation_day2$is_low_quality <- is_poor_quality_2
+t_act_l$Tcell_activation_day0_rep2$is_low_quality <- is_poor_quality_0_rep2
+t_act_l$Tcell_activation_day1_rep2$is_low_quality <- is_poor_quality_1_rep2
+map(t_act_l, function(seurat) {
+  seurat@meta.data %>% 
+    separate(col = "hash.ID", into = c("donor", "time", "temperature", "day"), sep = "-") %>% 
+    filter(!is.na(day)) %>% 
+    mutate(time = factor(time, levels = c("0h", "8h", "24h"))) %>% 
+    group_by(donor, time) %>% 
+    summarise(pct_low_quality = mean(is_low_quality) * 100) %>% 
+    ggplot(aes(time, pct_low_quality, fill = time)) +
+      geom_col() + 
+      labs(y = "% low-quality cells") +
+      facet_wrap(~donor) +
+      theme_bw() +
+      theme(legend.position = "none")
+})
+```
+
+  
+## Cell filtering
+
+In light of the above, we will discard the following cells:
+
+```{r}
+t_act_l <- map(t_act_l, function(seurat) {
+  seurat_sub <- subset(seurat, subset = is_low_quality == FALSE)
+  seurat_sub
+})
+t_act_l
+```
+
+## Doublet detection
+From the cellranger's web summary report and the demultiplexing of the hashtag oligonucleotides (HTO), we know that day 0 contained an excessive amount of cells. This suggests that we overloaded the cellranger lane and, although we can detect and remove most doublets thanks to the cell hashing, the homotypic doublets (those that share hashtag) still remain. Thus, we will try to predict and remove them with [`DoubletFinder`](https://www.cell.com/cell-systems/pdfExtended/S2405-4712(19)30073-0).
+
+DoubetFinder simulates doublets by averaging the UMI of two real cells. It subsequently project the simulations and real cells in PCA space and computes a nearest neighbors graph. Doublets are identified as those cells that have a proportion of artificial neighbors (pAN) greater than what you would expect by chance. We need to consider the following steps:
+
+1. Number of expected doublets: we know from our previous experiments that the doublet rate we obtain in cell hashing experiments scales linearly with the number of cells in the dataset, with a slope of 8% / 10000 cells. That is dr = 8e-4 n, where dr is the doublet rate in percentage and n is the number of cells. Thus, let us compute this estimated rates for our 4 datasets:
+
+```{r}
+dr <- map_dbl(t_act_l, ~ 0.0008 * ncol(.x))
+nExp_poi <- map2_dbl(dr, t_act_l, ~ .x * ncol(.y) / 100)
+```
+
+2. As described in DoubletFinder's [Github page](https://github.com/chris-mcginnis-ucsf/DoubletFinder), the most important parameter that can make-or-break the detection is the pK, which is the PC neighborhood size used to compute the proportion of Artificial Nearest Neighbors (pANN). Given that we have ground-truth doublets from our cell hashing predictions, we can use those to calculate the True Positive Rate (TPR) for varying pKs as proportion of hashing-labeled doublets that are identified by DoubletFinder:
+
+```{r}
+possible_pk <- c(
+  seq(0.001, 0.009, by = 0.001), 
+  seq(0.01, 0.09, by = 0.01), 
+  0.1, 0.15, 0.2, 0.25, 0.3
+)
+tprs_l <- map2(t_act_l, nExp_poi, function(seurat, nExp) {
+  seurat$doublets_hashing <- ifelse(seurat$hash.ID == "Doublet", "Doublet", "Singlet")
+  seurat <- pre_process_seurat(seurat)
+  tprs <- map_dbl(possible_pk, function(pK) {
+    seurat <- doubletFinder_v3(
+      seu = seurat, 
+      PCs = 1:10, 
+      pN = 0.25, 
+      pK = pK, 
+      nExp = nExp, 
+      reuse.pANN = FALSE, 
+      sct = FALSE
+    )
+    doublet_finder <- str_c("DF.classifications_0.25", pK, nExp, sep = "_")
+    tpr <- sum(seurat@meta.data[, doublet_finder] == "Doublet" & seurat$doublets_hashing == "Doublet") /
+           sum(seurat$doublets_hashing == "Doublet") * 100
+    tpr
+  })
+  tprs
+})
+saveRDS(tprs_l, "results/R_objects/true_positive_rates_doublets.rds")
+tprs_l
+```
+
+We can choose the pK that maximizes TPR:
+
+```{r}
+pk_opt <- map_dbl(tprs_l, function(x) {
+  df <- data.frame(pk = possible_pk, tpr = x)
+  df_max <- df[which.max(df$tpr), ]
+  print(ggplot(df, aes(pk, tpr)) +
+          geom_point(color = "blue") +
+          geom_line(color = "blue") + 
+          geom_text(data = df_max, aes(label = pk), color = "black") +
+          labs(x = "pK", y = "True Positive Rate (%)") +
+          theme_classic()
+  )
+  df_max[, "pk"]
+})
+pk_opt
+```
+
+Then, let us run DobuletFinder with the optimal pK:
+
+```{r}
+t_act_l <- pmap(list(t_act_l, pk_opt, nExp_poi), function(seurat, pk, nExp) {
+    seurat <- pre_process_seurat(seurat)
+    seurat <- doubletFinder_v3(
+    seu = seurat, 
+    PCs = 1:10, 
+    pN = 0.25, 
+    pK = pk, 
+    nExp = nExp, 
+    reuse.pANN = FALSE, 
+    sct = FALSE
+  )
+  seurat
+})
+```
+
+Finally, we can visualize the predictions:
+
+```{r}
+t_act_l <- purrr::map(t_act_l, function(seurat) {
+  doublet_col <- str_subset(colnames(seurat@meta.data), "^DF")
+  doublet_finder <- seurat@meta.data[, doublet_col]
+  seurat$doublet_hashing <- ifelse(seurat$hash.ID == "Doublet", "Doublet", "Singlet")
+  table(doublet_finder = doublet_finder, doublet_hashing = seurat$doublet_hashing)
+  seurat$doublet <- case_when(
+    doublet_finder == "Doublet" & seurat$doublet_hashing == "Doublet" ~ "Doublet 2X",
+    doublet_finder == "Doublet" & seurat$doublet_hashing == "Singlet" ~ "Doublet Finder",
+    doublet_finder == "Singlet" & seurat$doublet_hashing == "Doublet" ~ "Doublet Hashing",
+    doublet_finder == "Singlet" & seurat$doublet_hashing == "Singlet" ~ "Singlet"
+  )
+  seurat
+})
+purrr::map(t_act_l, ~ table(.x$doublet))
+umaps_doublets <- purrr::map(t_act_l, function(seurat) {
+  Idents(seurat) <- "doublet"
+  DimPlot(
+    seurat, 
+    reduction = "umap",
+    pt.size = 0.6, 
+    cols = c("#CD2C14", "#4FAA52", "#1A40AD", "#EEE2B9")
+  )
+})
+umaps_doublets
+```
+We can see that the doublets detected by hashing are mostly within a cluster, while the ones detected by DoubletFinder are mostly between clusters. This is consistent with the fact that DoubletFinder fails at detecting doublets with similar transcriptional states. All in all, both methods are complementary and allow us to remove the bulk of the doublets in the dataset. 
+
+We can proceed to filter them out:
+
+```{r}
+t_act_l <- purrr::map(t_act_l, function(seurat) {
+  Idents(seurat) <- "doublet"
+  seurat <- subset(seurat, idents = "Singlet")
+  seurat
+})
+t_act_l
+```
+
+# Gene QC
+Let us compute, for each gene, the number of cells in which we can detect at least 1 UMI:
+
+```{r}
+gene_qc_gg <- purrr::map(t_act_l, function(seurat) {
+  n_cells <- rowSums(as.matrix(seurat[["RNA"]]@counts) > 0)
+  n_cells %>% 
+    as.data.frame() %>% 
+    ggplot(aes(n_cells)) + 
+      geom_histogram(bins = 100, alpha = 0.75) +
+      scale_x_log10("Number of cells") +
+      theme_bw() 
+})
+gene_qc_gg
+```
+
+We see two peaks, the first one of which corresponds to lowly expressed genes. As explained in [Luecken MD et al.](https://www.embopress.org/doi/pdf/10.15252/msb.20188746): "a guideline to setting this threshold is to use the minimum cell cluster size that is of interest and leaving some leeway for dropout effects". As we will not rely on clusters that have fewer than `r min_total_cells` cells, we will use it as a filter:
+
+```{r}
+purrr::map(gene_qc_gg, function(p) {
+  p +
+    geom_vline(xintercept = min_total_cells, color = "red", linetype = "dashed")
+})
+t_act_sce <- purrr::map(t_act_l, function(seurat) {
+  n_cells <- rowSums(as.matrix(seurat[["RNA"]]@counts) > 0)
+  sce <- as.SingleCellExperiment(seurat)
+  sce <- sce[n_cells > min_total_cells, ]
+  sce
+})
+t_act_sce
+```
+
+# Normalization
+To confidently compare gene expression between cells, we need to correct for two biases:
+
+- Differences in library size: if one cell has more total counts than another due to sampling effects, genes that are equally expressed will show up as upregulated.
+- Between-sample systematic biases: if two conditions/donors were sequenced at different depths or in different batches, there might be compositional biases between conditions that yield a systematic up- or down-regulation.
+
+To correct for both, we will use the [`scran` package](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-016-0947-7)  which according to both a [recent](https://www.nature.com/articles/nmeth.4292) and an [old](https://www.biorxiv.org/content/10.1101/583013v2.full) review is the most robust method for scRNA-seq data normalization:
+
+```{r}
+t_act_sce <- purrr::map(t_act_sce, function(sce) {
+  sce <- computeSumFactors(sce)
+  print(summary(sizeFactors(sce)))
+  sce <- normalize(sce)
+  print(assays(sce))
+  logcounts(sce)[1:6, 1:6]
+  sce
+})
+t_act_sce
+```
+# Save Seurat object
+Finally, we can convert it back to seurat and save it as a compressed .RDS file for future analysis:
+
+```{r}
+# Recompute hash.ID variable
+t_act_seu <- purrr::map(t_act_sce, function(sce) {
+  seurat <- as.Seurat(sce)
+  seurat@meta.data <- seurat@meta.data %>% 
+    separate(col = "hash.ID", into = c("donor", "time", "temperature", "day"), sep = "-")
+  seurat
+})
+names(t_act_seu) <- c("day_0_rep1", "day_2_rep1", "day_0_rep2", "day_1_rep2")
+saveRDS(t_act_seu, "results/R_objects/t_act_Seurat_list_filtered_normalized.rds")
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
+

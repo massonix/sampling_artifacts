@@ -1,0 +1,355 @@
+---
+title: "Clustering & Cell Type Annotation"
+author: "Ramon Massoni-Badosa"
+date: "15/7/2019"
+output: 
+  BiocStyle::html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, out.width = "100%", fig.align='center', 
+                      message=FALSE, warning = FALSE)
+options(width = 1200)
+```
+
+```{r}
+# Key parameters
+num_significant_pcs <- 14
+k_resolution <- 0.01
+```
+
+# Introduction
+
+In the previous notebook, we filtered and normalized the expression matrix. In this notebook, we aim to identify the clusters of cells in the dataset and annotate them to the corresponding cell type. Furthermore, we will try to identify cycling cells.
+
+# Pre-processing
+
+## Package loading
+
+```{r}
+library(scater)
+library(scran)
+library(Seurat)
+library(ggpubr)
+library(tidyverse)
+library(kBET)
+library(cluster)
+library(DoubletFinder)
+```
+
+## Source script with functions
+
+```{r}
+source("bin/utils.R")
+```
+
+## Load data
+
+```{r}
+cll_seu <- readRDS("results/R_objects/cll_seurat_filtered_normalized.rds")
+cll_seu$barcode <- colnames(cll_seu)
+```
+
+# Find Variable Genes
+To cluster our cells, we need to overcome 2 challenges:
+
+1. The 'curse of dimensionality': as each cell can be conceived as a vector with >10,000 genes, and as two random cells will have the very similar expression for most genes, the distance measured between any given pair of cells will be very low, thus being unreliable for proper comparisons.
+2. Computational complexity: as the data is highly dimensional, even the most greedy algorithm will take long to complete. 
+3. Most genes should not be differentially expressed between cells, so the observed differences in such genes will be due to technical issues or transient biological states, that may confound the true structure in the dataset.
+
+Thus, we aim to eliminate redundancy and denoise the dataset. To this end, we will find the subset of genes that drive most of the variability in the expression matrix (feature selection). Seurat calculates the average expression and dispersion for each gene. Then, it divides genes into bins based on its average, and for each bin computes a z-score per gene. Those genes with a z-score above a certain cutoff are categorized as highly variable. The binning step is vital, since genes with more UMI tend to have more dispersion.
+
+```{r}
+cll_seu <- FindVariableFeatures(cll_seu)
+num_var_genes <- length(VariableFeatures(cll_seu))
+num_var_genes
+var_plot <- VariableFeaturePlot(cll_seu)
+var_plot <- LabelPoints(
+  plot = var_plot, 
+  points =  head(VariableFeatures(cll_seu), 10), 
+  repel = TRUE
+)
+var_plot
+```
+
+As we can see, we reduce the number of dimensions from >10,000 genes to `r num_var_genes` highly variable genes (HVG). Moreover, we see that among the top HVG there are well-known PBMC markers, such as LYZ, S100A8 (monocytes), GNLY and NKG7 (natural killer and CD8+ T cells).
+
+# Scale data
+An important pre-processing step in any cluster analysis is to scale the data, as otherwise variables with a higher mean will have a higher weight in the distance metric:
+
+```{r}
+cll_seu <- ScaleData(cll_seu)
+```
+
+# Linear dimensionality reduction (PCA)
+An additional challenge in our cluster analysis is that scRNAs-seq is very noisy (very susceptible to technical artifacts), and very sparse (contains drop-outs). Thus, differences in single genes may not be accurate to identify cell types. To that end, we can perform Principal Component Analysis, as PC can be conceived as a 'metagene' that includes information across a correlated gene set. Furthermore, we will reduce the dimensionality even more:             
+
+```{r}
+cll_seu <- RunPCA(cll_seu, features = VariableFeatures(cll_seu))
+VizDimLoadings(cll_seu, dims = 1:3, reduction = "pca")
+DimPlot(cll_seu, reduction = "pca")
+```
+
+# Determine statistically significant principal components
+To determine the number of significant PCs to use, we will take advantage of a scree plot. That is, we will plot the variance explained by each PC in an ordered manner. We identify the number of significant PCs as the one in which we can observe an "elbow" (i.e. the reduction in explained variance diminishes):
+
+```{r}
+ElbowPlot(cll_seu)
+```
+
+The elbow is in PC`r num_significant_pcs`, so that is what we are going to use to cluster cells using the `FindClusters` function.
+
+# Cluster cells
+- Describe Louvain algorithm, way to choose number of clusters, average silohuette width.
+Exploratory:
+To cluster cells we will used the Seurat's built-in functions `FindNeighbors` and `FindClusters`, which use the graph-based [Louvain](https://en.wikipedia.org/wiki/Louvain_modularity) algorithm. The critical parameter for these functions is the resolution, which will determine the final number of clusters. To decide it, we will compute the silhouette width for varying resolutions, and choose the one that maximizes it. Thus, we will end up with clusters that will be very similar within them and dissimilar between them:
+
+```{r}
+cll_seu <- FindNeighbors(cll_seu, dims = 1:num_significant_pcs)
+resolutions <- c(
+  0.00025, 0.0001, 0.0005, 
+  seq(0.01, 0.1, by = 0.01),
+  seq(0.1, 1, by = 0.1), seq(1, 10, by = 1)
+)
+avgs_sil_width_df <- data.frame(num_k = c(), sil_width = c(), resolution = c())
+num_k <- 1
+for (res in resolutions) {
+  cll_seu <-  FindClusters(cll_seu, resolution = res)
+  curr_num_k <- length(levels(cll_seu$seurat_clusters))
+  if (curr_num_k == num_k) {
+    next
+  } else {
+    sil_width <- calc_sil_width(
+      object = cll_seu, 
+      clusters = cll_seu$seurat_clusters, 
+      npcs = 5, 
+      ncell = 5000
+    )
+    curr_df <- data.frame(num_k = curr_num_k, sil_width = sil_width, resolution = res)
+    avgs_sil_width_df <- rbind(avgs_sil_width_df, curr_df)
+    num_k <- curr_num_k 
+  }
+}  
+ggplot(avgs_sil_width_df, aes(num_k, sil_width, label = num_k)) +
+  geom_text() +
+  labs(x = "Number of clusters (k)", y = "Average Silhouette Width") +
+  theme_classic()
+```
+
+As we can see, 5 clusters provides the maximal silhouette, so we will use the following resolution:
+
+```{r}
+filter(avgs_sil_width_df, num_k == num_k)
+cll_seu <- FindNeighbors(cll_seu, dims = 1:num_significant_pcs)
+cll_seu <- FindClusters(cll_seu, resolution = k_resolution)
+```
+
+# Non-linear dimensionality reduction 
+We can visualize the former clusters with a t-Stochastic Neighbor Embedding (tSNE) and uniform manifold approximation and projection (UMAP), which allow to depict more structure in the data than PCA:
+
+```{r}
+cll_seu <- RunTSNE(cll_seu, reduction = "pca", dims = 1:num_significant_pcs, check_duplicates = FALSE)
+cll_seu <- RunUMAP(cll_seu, reduction = "pca", dims = 1:num_significant_pcs)
+DimPlot(cll_seu, reduction = "tsne")
+DimPlot(cll_seu, reduction = "umap")
+num_k <- length(levels(cll_seu$seurat_clusters))
+num_k
+```
+
+As we can see, there are `r num_k` major clusters.
+
+# Find cluster markers
+Let us find the markers for each of the clusters. That is, the genes that are exclusively expressed in one cluster:
+
+```{r}
+markers <- FindAllMarkers(cll_seu, features = VariableFeatures(cll_seu))
+saveRDS(markers, "results/R_objects/markers_cll_clusters.rds")
+marker_selection <- unlist(map(0:(num_k-1), ~markers[markers$cluster == ., "gene"][0:5]))
+marker_selection
+DoHeatmap(cll_seu, features = marker_selection) + NoLegend()
+```
+
+As we know from the initial PBMC study, cluster 4 are monocytes (as they express LYZ + S100A8); whilst cluster 3 are T and NK cells (as they express NKG7, GNLY and IL7R). We can project these markers in UMAP space:
+
+```{r}
+FeaturePlot(
+  cll_seu, 
+  features = c("LYZ", "S100A8", "NKG7", "GNLY", "IL7R", "MS4A1"), 
+  reduction = "umap"
+)
+```
+
+Clusters 0, 1 and 3 are leukemic cells, as they express immunoglobulins (IGLC2, IGHM, IGLC3, IGHD, IGHG1, IGKC, IGHA1 and IGHA2). This is consistent with the fact that CLL cells have a constitutively active [B cell Receptor (BCR) signaling](https://www.cell.com/cell-reports/fulltext/S2211-1247(19)30849-6?_returnURL=https%3A%2F%2Flinkinghub.elsevier.com%2Fretrieve%2Fpii%2FS2211124719308496%3Fshowall%3Dtrue). 
+
+```{r}
+FeaturePlot(cll_seu, features = c("IGLC2", "IGKC", "IGHA1"), reduction = "umap")
+```
+
+CLL possesses a vast [inter-patient variability](https://genome.cshlp.org/content/24/2/212/F4.expansion.html), and thus we expect clusters 0, 1 and 2 to be from the three different donors (1220, 1472, 1892):
+
+```{r}
+Idents(cll_seu) <- "donor"
+DimPlot(cll_seu, reduction = "umap")
+```
+
+# Cell cycle scoring
+
+We can detect dividing cells with cell-cycle signatures:
+
+```{r}
+s_genes <- cc.genes$s.genes[cc.genes$s.genes %in% rownames(cll_seu@assays$RNA@scale.data)]
+g2m_genes <- cc.genes$g2m.genes[cc.genes$g2m.genes %in% rownames(cll_seu@assays$RNA@scale.data)]
+cll_seu <- CellCycleScoring(object = cll_seu, s.features = s_genes, g2m.features = g2m_genes)
+FeaturePlot(object = cll_seu, features = c("S.Score", "G2M.Score"))
+```
+
+Although one would expect that leukemic cells are cycling, we have to keep in mind that this is a chronic disease were cells accumulate during decades. Thus, at a single time-point it is hard to detect differencesin cell proliferation
+
+# Assigning cell type identity to clusters
+Based on the previous findings, we can annotate each cluster to known cell types:
+
+Cluster ID | Markers            | Cell Type
+-----------|--------------------|----------
+0          | IGLC2              | CLL 1892
+1          | IGKC               | CLL 1472
+2          | IGHA1              | CLL 1220
+3          | GNLY, NKG7, IL7R   | T and NK
+4          | LYZ, S100A         | Monocytes
+
+```{r}
+Idents(cll_seu) <- "seurat_clusters"
+new_cluster_ids <- c("CLL 1892", "CLL 1472", "CLL 1220", "T and NK", "Monocyte")
+names(new_cluster_ids) <- levels(cll_seu)
+cll_seu <- RenameIdents(cll_seu, new_cluster_ids)
+cll_seu$cell_type <- Idents(cll_seu)
+DimPlot(cll_seu, reduction = "umap", label = TRUE, pt.size = 0.5) + NoLegend()
+```
+
+# Doublet detection
+Although conceptually this step would belong to the quality control and normalization notebook, we will proceed to detect the doublets present in our dataset. We carry it out here because we will use [DoubletFinder](https://www.cell.com/cell-systems/fulltext/S2405-4712(19)30073-0?_returnURL=https%3A%2F%2Flinkinghub.elsevier.com%2Fretrieve%2Fpii%2FS2405471219300730%3Fshowall%3Dtrue), a tool that works with a fully processed Seurat object. 
+
+DoubetFinder simulates doublets by averaging the UMI of two real cells. It subsequently project the simulations and real cells in PCA space and computes a nearest neighbors graph. Doublets are identified as those cells that have a proportion of artificial neighbors (pAN) greater than what you would expect by chance.
+
+Note that different donors and temperatures were sequenced in different 10X lanes. Hence, as it is impossible to find doublets from two different sequencing libraries, we will split the object by library:
+
+```{r}
+# Create list of seurat objects (split by library)
+cll_seu$library <- str_c(cll_seu$donor, cll_seu$temperature, sep = "_")
+cll_seu_l <- SplitObject(cll_seu, split.by = "library")
+
+# Preprocess independently
+cll_seu_l <- purrr:::map(cll_seu_l, function(seurat) {
+  seurat %>% 
+    NormalizeData() %>% 
+    FindVariableFeatures() %>%
+    ScaleData() %>% 
+    RunPCA() %>% 
+    RunTSNE(dims = 1:15) %>% 
+    RunUMAP(dims = 1:15)
+})
+umaps_l <- purrr::map(cll_seu_l, DimPlot, reduction = "umap")
+ggarrange(plotlist = umaps_l, nrow = 3, ncol = 2)
+```
+
+The most important parameter to tune when using DoubletFinder is pK, which is the PC neighborhood size used to compute the proportion of artificial neighbors (pANN), as explained in the [github page](https://github.com/chris-mcginnis-ucsf/DoubletFinder) of the package. We can optimize this parameter as follows:
+
+```{r}
+# pK identification
+pk_dbl <- purrr::map_dbl(cll_seu_l, function(seurat) {
+  sweep_res_list <- paramSweep_v3(seurat, PCs = 1:10, sct = FALSE)
+  sweep_stats <- summarizeSweep(sweep_res_list, GT = FALSE)
+  bcmvn <- find.pK(sweep_stats)
+  pK <- as.numeric(as.character((bcmvn[which.max(bcmvn$BCmetric), "pK"])))
+  pK
+})
+```
+
+Now we are equipped to run DoubletFinder:
+
+```{r}
+cll_seu_l <- map2(cll_seu_l, pk_dbl, function(seurat, pk) {
+  nExp_poi <- round(0.1 * ncol(seurat))
+  seurat <- doubletFinder_v3(
+    seu = seurat, 
+    PCs = 1:10, 
+    pN = 0.25, 
+    pK = pk, 
+    nExp = nExp_poi, 
+    reuse.pANN = FALSE, 
+    sct = FALSE
+  )
+})
+```
+
+We can add the annotations back to the original Seurat object:
+
+```{r}
+doublet_annot <- purrr::map(cll_seu_l, function(seurat) {
+ selected_column <- str_subset(
+   string = colnames(seurat@meta.data), 
+   pattern = "^DF.classifications"
+ )
+ doub_find <- seurat@meta.data[, selected_column, drop = FALSE] 
+ colnames(doub_find) <- "doublet_annot"
+ doub_find <- rownames_to_column(doub_find, var = "barcode")
+ doub_find
+})
+doublet_annot <- bind_rows(doublet_annot, .id = "library")
+rownames(doublet_annot) <- doublet_annot$barcode
+doublet_annot <- doublet_annot[colnames(cll_seu), ]
+cll_seu$doublet_annot <- doublet_annot$doublet_annot
+
+# Visualize
+Idents(cll_seu) <- "doublet_annot"
+DimPlot(cll_seu, reduction = "umap")
+```
+
+As a validation, we can load the demultiplexed and unfiltered seurat object, remove all cells not present in the current object, add the annotation of DoubletFinder, process the object and assess if the cell hashing-derived and DF-derived doublets cluster together:
+
+```{r}
+cll_ori <- readRDS("results/R_objects/cll_Seurat_demultiplexed.rds")
+cll_ori$barcode <- colnames(cll_ori)
+cll_ori <- subset(cll_ori, hash.ID == "Doublet" | barcode %in% colnames(cll_seu))
+cll_ori$hash.ID[cll_ori$hash.ID == "Doublet"] <- "Doublet_hashing"
+doublet_finder_barcodes <- colnames(cll_seu)[cll_seu$doublet_annot == "Doublet"]
+cll_ori$hash.ID[doublet_finder_barcodes] <- "Doublet_Finder"
+singlet_barcodes <- colnames(cll_seu)[cll_seu$doublet_annot == "Singlet"]
+cll_ori$hash.ID[singlet_barcodes] <- "Singlet"
+
+# Pre-process
+cll_ori <- cll_ori %>% 
+  NormalizeData() %>% 
+  FindVariableFeatures() %>% 
+  ScaleData() %>% 
+  RunPCA() %>% 
+  RunUMAP(dims = 1:10)
+Idents(cll_ori) <- "hash.ID"
+DimPlot(cll_ori, reduction = "umap")
+```
+
+As we can see, DoubletFinder-predicted doublets hashing-predicted doublets, cluster together, which validates the rpedictions of DoubletFinder. Hence, we can clean our dataset even more and filter them out:
+
+```{r}
+cll_seu <- subset(cll_seu, subset = doublet_annot == "Singlet")
+cll_seu
+```
+
+Idea: given that we have ground-truth about between-timepoint doublets, we could find, for each cell, the proportion of neareast doublets, correlate it with highly-expressing genes and discard the outliers.
+
+# Save Seurat object
+
+```{r}
+saveRDS(cll_seu, file = "results/R_objects/cll_seurat_annotated.rds")
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
+
+
+

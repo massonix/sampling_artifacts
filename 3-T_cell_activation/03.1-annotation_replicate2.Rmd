@@ -1,0 +1,328 @@
+---
+title: "Cell Type Annotation - T cell activation (rep 2)"
+author: "Ramon Massoni-Badosa"
+date: "12/4/2019"
+output: 
+  BiocStyle::html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, out.width = "100%", fig.align='center', 
+                      message=FALSE, warning = FALSE)
+options(width = 1200)
+```
+
+# Introduction
+The purpose of this notebook is to annotate the cell types of the two new T cell culturing & activation experiments (replicate 2). It will follow the same steps as replcate 1, so we refer to the notebook "03-annotation.Rmd" for a full explanation of each step.
+
+# Pre-processing
+
+## Package loading
+
+```{r}
+library(scater)
+library(scran)
+library(Seurat)
+library(ggpubr)
+library(kBET)
+library(cluster)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(viridis)
+library(tidyverse)
+```
+
+## Source script with functions
+
+```{r}
+source("bin/utils.R")
+```
+
+## Load data
+
+```{r}
+t_act_l <- readRDS("results/R_objects/t_act_Seurat_list_filtered_normalized.rds")
+```
+
+Let us filter the previous list to retain only replicate 2:
+
+```{r}
+t_act_l <- t_act_l[c("day_0_rep2", "day_1_rep2")]
+```
+
+# Find Variable Genes
+
+```{r}
+t_act_0_rep2 <- SplitObject(t_act_l$day_0_rep2, split.by = "donor")
+t_act_1_rep2 <- SplitObject(t_act_l$day_1_rep2, split.by = "donor")
+t_act_l <- list(
+  t_act_0_rep2$Female2, 
+  t_act_0_rep2$Female3, 
+  t_act_1_rep2$Female2, 
+  t_act_1_rep2$Female3
+)
+names(t_act_l) <- c("0_rep2_F2", "0_rep2_F3", "1_rep2_F2", "1_rep2_F3")
+t_act_l <- purrr::map(t_act_l, FindVariableFeatures)
+var_plots <- purrr::map(t_act_l, VariableFeaturePlot)
+var_plots <- purrr::map2(t_act_l, var_plots, function(seurat, p) {
+  LabelPoints(
+  plot = p, 
+  points =  head(VariableFeatures(seurat), 10), 
+  repel = TRUE
+  )
+})
+var_plots
+```
+
+Again, in the activated cells (day 1), we see that interferon gamma is the most variable gene.
+
+# Scale data
+
+```{r}
+t_act_l <- purrr::map(t_act_l, ScaleData)
+```
+
+# Linear dimensionality reduction (PCA)
+
+```{r}
+t_act_l <- purrr::map(t_act_l, RunPCA)
+purrr::map(t_act_l, VizDimLoadings, dims = 1:3, reduction = "pca")
+purrr::map(t_act_l, DimPlot, reduction = "pca")
+```
+# Cluster cells
+
+```{r}
+t_act_l <- purrr::map(t_act_l, FindNeighbors, dims = 1:20)
+resolutions <- c(
+  0.005,
+  seq(0.01, 0.1, by = 0.01),
+  seq(0.1, 1, by = 0.1), seq(1, 10, by = 1)
+)
+avgs_sil_width_dfs <- purrr::map2(t_act_l, names(t_act_l), function(seurat, condition) {
+  print(condition)
+  avgs_sil_width_df <- data.frame(num_k = c(), sil_width = c(), resolution = c())
+  num_k <- 1
+  for (res in resolutions) {
+    print(str_c("Current resolution is ", res))
+    seurat <-  FindClusters(seurat, resolution = res, verbose = FALSE)
+    curr_num_k <- length(levels(seurat$seurat_clusters))
+    if (curr_num_k == num_k) {
+      next
+    } else {
+      sil_width <- calc_sil_width(
+        object = seurat, 
+        clusters = seurat$seurat_clusters, 
+        npcs = 5, 
+        ncell = 2500
+      )
+      print(str_c("Current silhouette width is ", sil_width))
+      curr_df <- data.frame(num_k = curr_num_k, sil_width = sil_width, resolution = res)
+      avgs_sil_width_df <- rbind(avgs_sil_width_df, curr_df)
+      num_k <- curr_num_k 
+      print(str_c("Current number of clusters is ", num_k))
+    }
+  }
+  avgs_sil_width_df
+})
+resolution_plots <- purrr::map2(avgs_sil_width_dfs, names(avgs_sil_width_dfs), function(df, cond) {
+  ggplot(df, aes(num_k, sil_width, label = num_k)) +
+    geom_text() +
+    labs(title = cond,
+         x = "Number of clusters (k)", 
+         y = "Average Silhouette Width") +
+    theme_classic() +
+    theme(plot.title = element_text(hjust = 0.5))
+})
+resolution_plots
+```
+
+We aim to determine a number of clusters that maximizes silhouette width while preventing overstratification. Judgding by the previous plots, we define the following k:
+
+* 0_rep2_F2: 5
+* 0_rep2_F3: 4
+* 1_rep2_F2: 5
+* 1_rep2_F3: 5
+
+```{r}
+optimal_k <- c(5, 4, 5, 5)
+t_act_l <- purrr::pmap(list(t_act_l, avgs_sil_width_dfs, optimal_k), function(seurat, df, opt_k) {
+  opt_resolution <- df[df$num_k == opt_k, "resolution"]
+  seurat <- FindClusters(object = seurat, resolution = opt_resolution)
+  seurat
+})
+purrr::map(t_act_l, ~ length(levels(.x$seurat_clusters)))
+```
+
+# Non-linear dimensionality reduction 
+
+```{r}
+t_act_l <- purrr::map(t_act_l, function(seurat) {
+  seurat@reductions$PCA <- NULL
+  seurat@reductions$TSNE <- NULL
+  seurat@reductions$UMAP <- NULL
+  seurat
+})
+t_act_l <- purrr::map(t_act_l, RunTSNE, reduction = "pca", dims = 1:20)
+t_act_l <- purrr::map(t_act_l, RunUMAP, reduction = "pca", dims = 1:20)
+purrr::map(t_act_l, DimPlot, reduction = "tsne")
+purrr::map(t_act_l, DimPlot, reduction = "umap")
+```
+
+# Find cluster markers
+
+```{r}
+markers_l <- purrr::map(t_act_l, FindAllMarkers)
+saveRDS(markers_l, "results/R_objects/t_act_markers_list_rep2.rds")
+marker_selection <- purrr::map2(t_act_l, markers_l, function(seurat, df) {
+  num_k <- length(unique(seurat$seurat_clusters))
+  selection <- unlist(purrr::map(0:(num_k-1), ~df[df$cluster == .x, "gene"][0:8]))
+  selection
+})
+heatmaps_markers <- purrr::map2(t_act_l, marker_selection, ~DoHeatmap(.x, features = .y) + NoLegend())
+heatmaps_markers
+```
+
+# Cell cycle scoring
+
+```{r}
+t_act_l <- purrr::map(t_act_l, function(seurat) {
+  s_genes <- cc.genes$s.genes[cc.genes$s.genes %in% rownames(seurat@assays$RNA@scale.data)]
+  g2m_genes <- cc.genes$g2m.genes[cc.genes$g2m.genes %in% rownames(seurat@assays$RNA@scale.data)]
+  seurat <- CellCycleScoring(object = seurat, s.features = s_genes, g2m.features = g2m_genes)
+  seurat
+})
+cycling_gg <- purrr::map(t_act_l, FeaturePlot, features = c("S.Score", "G2M.Score"), cols = viridis(20))
+cycling_gg
+```
+
+# T cell stimulation signature
+
+```{r}
+anti_cd3_signature <- c("IL2RA", "IL1R", "IL12RB2", "IL18R1", "IL21R", "IL23R", 
+                        "FOXP3", "CTLA4", "TNFRSF18", "LAG3", "PDCD1", "INFG", 
+                        "IL17A", "IL17F", "LIF", "TNF", "IL1B", "IL6", "IL32", 
+                        "IL2", "IL3", "IL9", "IL12B", "IL21", "IL22", "CD25", 
+                        "IL1R2", "TBX21", "STAT4", "GMZB", "EOMES", "GZMB", 
+                        "TNFRSF4", "TNFRSF9", "GITR", "XCL1", "IDO1", "NR4A1", 
+                        "RORC")
+t_act_l <- purrr::map(
+  t_act_l, 
+  AddModuleScore, 
+  features = list(anti_cd3_signature), 
+  name = "anti_cd3_score"
+)
+anti_cd3_gg <- purrr::map(
+  t_act_l, 
+  FeaturePlot, 
+  features = "anti_cd3_score1", 
+  reduction = "umap",
+  cols = viridis(30),
+  pt.size = 1.25
+)
+anti_cd3_gg
+```
+
+#  Annotation
+
+## 0_rep2_F2
+Cluster ID | Cell type       
+-----------|---------------
+0          | T 
+1          | NK          
+2          | Monocytes
+3          | B 
+4          | Dendritic Cells
+
+```{r}
+FeaturePlot(t_act_l$`0_rep2_F2`, features = c("IL7R", "CD3D"))
+t_act_l$`0_rep2_F2`$cell_type <- case_when(
+  t_act_l$`0_rep2_F2`$seurat_clusters == "0" ~ "T",
+  t_act_l$`0_rep2_F2`$seurat_clusters == "1" ~ "NK",
+  t_act_l$`0_rep2_F2`$seurat_clusters == "2" ~ "Monocyte",
+  t_act_l$`0_rep2_F2`$seurat_clusters == "3" ~ "B",
+  t_act_l$`0_rep2_F2`$seurat_clusters == "4" ~ "Dendritic Cell"
+)
+Idents(t_act_l$`0_rep2_F2`) <- "cell_type"
+DimPlot(t_act_l$`0_rep2_F2`, reduction = "umap", label = TRUE) + NoLegend()
+```
+
+## 0_rep2_F3
+Cluster ID | Cell type       
+-----------|---------------
+0          | CD4 T
+1          | Monocytes 
+2          | Cytotoxic
+3          | B 
+
+```{r}
+FeaturePlot(t_act_l$`0_rep2_F3`, features = c("IL7R", "CD3D"))
+t_act_l$`0_rep2_F3`$cell_type <- case_when(
+  t_act_l$`0_rep2_F3`$seurat_clusters == "0" ~ "CD4 T",
+  t_act_l$`0_rep2_F3`$seurat_clusters == "1" ~ "Monocyte",
+  t_act_l$`0_rep2_F3`$seurat_clusters == "2" ~ "Cytotoxic",
+  t_act_l$`0_rep2_F3`$seurat_clusters == "3" ~ "B"
+)
+Idents(t_act_l$`0_rep2_F3`) <- "cell_type"
+DimPlot(t_act_l$`0_rep2_F3`, reduction = "umap", label = TRUE) + NoLegend()
+```
+
+## 1_rep2_F2
+Cluster ID | Cell type       
+-----------|---------------
+0          | Cycling T
+1          | NK          
+2          | Activated T
+3          | B 
+4          | Mitotic
+
+```{r}
+FeaturePlot(t_act_l$`1_rep2_F2`, features = c("IL7R", "CD3D"))
+t_act_l$`1_rep2_F2`$cell_type <- case_when(
+  t_act_l$`1_rep2_F2`$seurat_clusters == "0" ~ "Cycling T",
+  t_act_l$`1_rep2_F2`$seurat_clusters == "1" ~ "NK",
+  t_act_l$`1_rep2_F2`$seurat_clusters == "2" ~ "Activated T",
+  t_act_l$`1_rep2_F2`$seurat_clusters == "3" ~ "B",
+  t_act_l$`1_rep2_F2`$seurat_clusters == "4" ~ "Mitotic"
+)
+Idents(t_act_l$`1_rep2_F2`) <- "cell_type"
+DimPlot(t_act_l$`1_rep2_F2`, reduction = "umap", label = TRUE) + NoLegend()
+```
+
+## 1_rep2_F3
+Cluster ID | Cell type       
+-----------|---------------
+0          | Cycling T
+1          | Activated T          
+2          | NK
+3          | B 
+4          | Mitotic
+
+```{r}
+FeaturePlot(t_act_l$`1_rep2_F3`, features = c("IL7R", "CD3D"))
+t_act_l$`1_rep2_F3`$cell_type <- case_when(
+  t_act_l$`1_rep2_F3`$seurat_clusters == "0" ~ "Cycling T",
+  t_act_l$`1_rep2_F3`$seurat_clusters == "1" ~ "Activated T",
+  t_act_l$`1_rep2_F3`$seurat_clusters == "2" ~ "NK",
+  t_act_l$`1_rep2_F3`$seurat_clusters == "3" ~ "B",
+  t_act_l$`1_rep2_F3`$seurat_clusters == "4" ~ "Mitotic"
+)
+Idents(t_act_l$`1_rep2_F3`) <- "cell_type"
+DimPlot(t_act_l$`1_rep2_F3`, reduction = "umap", label = TRUE) + NoLegend()
+```
+
+# Save
+
+```{r}
+saveRDS(t_act_l, file = "results/R_objects/t_act_Seurat_list_annotated_rep2")
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
+
+

@@ -1,0 +1,160 @@
+---
+title: "PBMC storage adjustment"
+author: "Ramon Massoni-Badosa"
+date: "10/21/2019"
+output: 
+  BiocStyle::html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, out.width = "100%", fig.align='center', 
+                      message=FALSE, warning = FALSE)
+options(width = 1200)
+```
+
+# Introduction
+The objective of this notebook is to assess if storing blood samples at 4ºC before cryopreservation yields better single-cell transcriptomes than storing them at room temperature (RT).
+
+# Pre-processing
+
+## Package loading
+
+```{r}
+library(scater)
+library(scran)
+library(Seurat)
+library(ggpubr)
+library(biomaRt)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(GOplot)
+library(GOstats)
+library(kBET)
+library(topGO)
+library(ggrepel)
+library(viridis)
+library(pheatmap)
+library(tidyverse)
+```
+
+## Source script with functions
+
+```{r}
+source("bin/utils.R")
+```
+
+## Load data
+We dispose of a demultiplexed, filtered, normalized and annotated Seurat object that contains the transcriptome and metadata  of >10,000 Peripheral Blood Mononuclear Cells (PBMC) from two donors (male/female) that were kept at varying times at RT (0h, 2h, 8h, 24h, 48h).
+
+```{r}
+pbmc <- readRDS("results/R_objects/10X_pbmc_Seurat_clustered.RDS")
+pbmc_l <- readRDS("results/R_objects/10X_pbmc_Seurat_donors_list_clustered.RDS")
+pbmc_l <- purrr::map(pbmc_l, function(seurat) {
+  seurat$temperature <- case_when(
+  seurat$condition %in% c("0h", "2h") ~ "fresh",
+  seurat$condition %in% c("8h", "24h_RT", "48h_RT") ~ "RT",
+  seurat$condition %in% c("24h_4C", "48h_4C") ~ "4ºC"
+  )
+  seurat$temperature <- factor(seurat$temperature, levels = c("fresh", "RT", "4ºC"))
+  seurat$time <- str_remove(seurat$condition, pattern = "_4C|_RT")
+  seurat
+})
+```
+
+# Visualize mixability
+
+```{r}
+# UMAP
+umap_temperature <- purrr::map(pbmc_l, function(seurat) {
+  Idents(seurat) <- "temperature"
+  DimPlot(seurat, reduction = "umap", cols = c("#999999", "darkorange1", "#a5cded"))
+})
+umap_temperature
+saveRDS(umap_temperature$female, "results/R_objects/ggplots/umap_4C_pbmc.rds")
+
+# tSNE
+tsne_temperature <- purrr::map(pbmc_l, function(seurat) {
+  Idents(seurat) <- "temperature"
+  DimPlot(seurat, reduction = "tsne", cols = c("#999999", "darkorange1", "#a5cded"))
+})
+tsne_temperature
+saveRDS(tsne_temperature$female, "results/R_objects/ggplots/tsne_4C_pbmc.rds")
+```
+
+# Quantify mixability (kBET)
+
+```{r}
+pbmc_female <- pbmc_l$female
+temperatures <- c("RT", "4ºC")
+Idents(pbmc_female) <- "temperature"
+acceptance_rate_dbl <- purrr::map_dbl(temperatures, function(temp) {
+  seurat_sub <- subset(pbmc_female, idents = c("fresh", temp))
+  seurat_sub$is_biased <- ifelse(seurat_sub$temperature == "fresh", FALSE, TRUE)
+  mat <- as.matrix(seurat_sub@reductions$umap@cell.embeddings)
+  batch <- seurat_sub$is_biased
+  batch_estimate <- kBET(mat, batch = batch, verbose = TRUE, heuristic = FALSE, testSize = 50)
+  batch_results <- batch_estimate$results
+  batch_results <- batch_results %>% 
+    mutate(cell_type = seurat_sub$cell_type,
+           time = seurat_sub$time) %>% 
+    filter(tested == 1) %>% 
+    summarise(acceptance_rate = mean(kBET.pvalue.test > 0.05) * 100)
+  batch_results$acceptance_rate
+})
+
+acceptance_rate_df <- data.frame(
+  temperature = temperatures, 
+  acceptance_rate = acceptance_rate_dbl
+)
+
+acceptance_rate_gg <- acceptance_rate_df %>% 
+  mutate(temperature = factor(temperature, levels = c("RT", "4ºC"))) %>% 
+  ggplot(aes(temperature, acceptance_rate, fill = temperature)) +
+    geom_col(position = "dodge") +
+    scale_y_continuous(limits = c(0, 50)) +
+    scale_fill_manual(values = c("darkorange1", "#a5cded")) +
+    labs(x = "", y = "kBET (acceptance rate)", fill = "") +
+    theme_classic() +
+    theme(axis.text = element_text(size = 11), 
+          axis.title.y = element_text(size = 13), 
+          legend.text = element_text(size = 11))
+acceptance_rate_gg
+saveRDS(
+  acceptance_rate_gg, 
+  "results/R_objects/ggplots/barplot_acceptance_rate_storage_pbmc.rds"
+)
+```
+
+# Differential Expression Analysis
+
+```{r}
+Idents(pbmc_female) <- "temperature"
+pbmc_f_sub <- subset(pbmc_female, idents = c("fresh", "4ºC"))
+dea <- FindMarkers(pbmc_f_sub, ident.1 = "4ºC", test.use = "wilcox")
+dea <- rownames_to_column(dea, var = "gene")
+dea <- dplyr::mutate(dea, significance = ifelse(p_val_adj < 0.001, "sig", "no sig"))
+subset_data <- dplyr::filter(dea, avg_logFC > 0.9)
+volcano <- dea %>% 
+  dplyr::mutate(significance = ifelse(p_val_adj < 0.001, "sig", "no sig")) %>% 
+  ggplot(aes(avg_logFC, -1 * log10(p_val_adj), color = significance)) +
+    geom_point() +
+    geom_text_repel(data = subset_data, aes(label = gene), color = "black", size = 2.5) +
+    scale_color_manual(values = c("gray78", "chartreuse2")) +
+    labs(x = "log (fold-change)", y = "-log10 (p-value)", color = "") +
+    theme_classic()
+volcano
+saveRDS(volcano, "results/R_objects/ggplots/volcano_4ºC_pbmc.rds")
+```
+Overall, we detected a total of `r sum(dea$significance == "sig")` differential expressed genes (DEG), `r sum(dea$significance == "sig" & dea$avg_logFC > 0)` of which were upregulated and `r sum(dea$significance == "sig" & dea$avg_logFC < 0)` were downregulated.
+
+# Session Information
+
+```{r}
+sessionInfo()
+```
+
+
+

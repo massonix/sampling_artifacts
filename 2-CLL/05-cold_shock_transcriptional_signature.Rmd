@@ -1,0 +1,338 @@
+---
+title: "Cold-Shock Transcriptional Signature"
+author: "Ramon Massoni-Badosa"
+date: "10/2/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+The objective of this notebook is to characterize the transcriptional signature associated with time at room temperature (RT) until cryopreservation in chronic lymphocytic leukemia cells (CLL). We hypothesize that, as we are extracting blood cells from its physiological niche (~37ºC) and placing them at RT (~21ºC), they will express a transcriptional that allows them to cope to the change in temperature.
+
+# Pre-processing
+
+## Package loading
+
+```{r}
+library(scater)
+library(scran)
+library(Seurat)
+library(ggpubr)
+library(biomaRt)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(GOplot)
+library(GOstats)
+library(topGO)
+library(ggrepel)
+library(viridis)
+library(pheatmap)
+library(tidyverse)
+```
+
+## Source script with functions
+
+```{r}
+source("bin/utils.R")
+```
+
+## Load data
+Our starting data is a list of Seurat objects that we saved in the previous notebook.  Each object contains more than 10,000 cells that come from a single CLL donor and were left at RT for several hours. Moreover, the Seurat objects are fully processed (filtered, normalized, scaled, annotated and clustered). Moreover, we will also load the original processed object prior to splitting by donor:
+
+```{r}
+cll_rt_l <- readRDS(file = "results/R_objects/cll_rt_seurat_list.rds")
+cll_rt <- readRDS("results/R_objects/cll_seurat_annotated.rds")
+cll_rt <- subset(cll_rt, temperature == "RT")
+```
+
+# Transcriptional signature
+To find the transcriptional signature associated with time, we will conduct a differential expression analysis between time-biased and time-unbiased cells. Such distinction is based in our previous results, which show that cells that are >=4h at RT prior to cryopreservation possess altered transcriptional landscapes in comparison to those left for <4h. Although time and gene expression are both quantitative variables, we will not use a linear regression to test for the effect of time for two main reasons:
+
+1. The sparsity of the data precludes the utility of a linear regression, such that only house-keeping and highly-expressed genes in general harbor enough to fit a statistically meaningful line, which means that the results would favour such genes.
+2. The time-points are discrete and have an outlier value (24h).
+
+We will opt to use a wilcoxon test. Despite the fact that there are recent methods that are tailored to scRNA-seq DE, recent benchmarking suggest that [(1)](https://www.nature.com/articles/nmeth.4612) wilcoxon test is still among the best-performing tools and [(2)](https://www.biorxiv.org/content/10.1101/583013v2.full) with scran normalization there is no need for tailored methods.
+
+
+First, let us assess the differential expression analysis for all cell types together:
+
+```{r}
+cll_rt$is_biased <- ifelse(cll_rt$time %in% c("0h", "2h"), "unbiased", "biased")
+Idents(cll_rt) <- "is_biased"
+dea_general <- FindMarkers(cll_rt, ident.1 = "biased", test.use = "wilcox")
+dea_general <- dea_general %>%
+  rownames_to_column(var = "gene") %>% 
+  dplyr::mutate(is_significant = ifelse(p_val_adj < 0.001, TRUE, FALSE))
+dea_general
+
+# MA plot
+log2_fc <- apply(as.matrix(cll_rt[["RNA"]]@data), 1, function(x) {
+  mean_unbiased <- mean(x[cll_rt$is_biased == "unbiased"]) + 1
+  mean_biased <- mean(x[cll_rt$is_biased == "biased"]) + 1
+  log2(mean_biased / mean_unbiased)
+})
+genes <- rownames(cll_rt[["RNA"]]@data)
+is_significant <- ifelse(genes %in% dea_general$gene[dea_general$is_significant], TRUE, FALSE)
+avg_expr <- rowMeans(as.matrix(cll_rt[["RNA"]]@data[genes, ]))
+dea_all <- data.frame(
+  gene = genes, 
+  average_expression = avg_expr, 
+  log2_fc = log2_fc,
+  is_significant = is_significant
+)
+subset_sig <- dplyr::filter(dea_all, is_significant & abs(log2_fc) > 0.25 & average_expression > 0.5)
+ma_plot <- dea_all %>% 
+  ggplot(aes(log(average_expression + 1), log2_fc, color = is_significant)) +
+    geom_point(size = 0.85, alpha = 0.6) +
+    geom_smooth(method = "loess", color = "darkblue") +
+    geom_hline(yintercept = 0, color = "black", linetype = "dashed") +
+    geom_text_repel(data = subset_sig, aes(label = gene), color = "black", size = 2.5) +
+    scale_color_manual(values = c("gray78", "green4"), labels = c("sig", "no sig")) +
+    labs(x = "log (Average Expression)", y = "log2 (biased / unbiased)", color = "") +
+    theme_classic2() +
+    theme(axis.title = element_text(size = 11),
+          legend.text = element_text(size = 11),
+          plot.title = element_text(hjust = 0.5, face = "bold"))
+ma_plot
+saveRDS(ma_plot, "results/R_objects/ggplots/ma_plot_all_cell_types_cll.rds")
+saveRDS(dea_all, "results/R_objects/dea_results_cll.rds")
+cold_shock_signature_up <- dea_general$gene[dea_general$is_significant & dea_general$avg_logFC > 0]
+saveRDS(cold_shock_signature_up, "results/R_objects/cold_shock_signature_up.rds")
+```
+
+Overall, we detected a total of `r sum(dea_general$is_significant)` differential expressed genes (DEG), `r sum(dea_general$is_significant & dea_general$avg_logFC > 0)` of which were upregulated and `r sum(dea_general$is_significant & dea_general$avg_logFC < 0)` were downregulated.
+
+Finally, we will perform the analysis for each donor separately, as this will allow us to elucidate the specificity of the signature downstream:
+
+```{r}
+dea_list <- purrr::map(cll_rt_l, function(seurat) {
+  seurat$is_biased <- ifelse(seurat$time %in% c("0h", "2h"), "unbiased", "biased")
+  Idents(seurat) <- "is_biased"
+  dea <- FindMarkers(seurat, ident.1 = "biased", test.use = "wilcox", logfc.threshold = 0, min.pct = 0)
+  dea <- dea %>%
+    rownames_to_column(var = "gene") %>% 
+    mutate(is_significant = ifelse(p_val_adj < 0.001, TRUE, FALSE))
+  avg_expr <- rowMeans(as.matrix(seurat[["RNA"]]@data[dea$gene, ]))
+  dea$avg_expr <- avg_expr
+  dea
+})
+saveRDS(dea_list, "results/R_objects/dea_results_per_patient.rds")
+```
+
+Let us assess the overall distribution of the diferentially expressed genes (DEG) with an MA plot:
+
+```{r}
+ma_plot_list <- purrr::map2(dea_list, names(dea_list), function(dea, donor) {
+  subset_sig <- filter(dea, is_significant & log(avg_expr + 1) > 0.4 & abs(avg_logFC) > 0.5)
+  dea %>% 
+  ggplot(aes(log(avg_expr + 1), avg_logFC, color = is_significant)) +
+    geom_point() +
+    geom_smooth(method = "loess", color = "darkblue") +
+    geom_hline(yintercept = 0, color = "black", linetype = "dashed") +
+    geom_text_repel(data = subset_sig, aes(label = gene), color = "black") +
+    scale_color_manual(values = c("gray78", "green4"), labels = c("sig", "no sig")) +
+    labs(title = donor, x = "log (Average Expression)", y = "log (biased / unbiased)", color = "") +
+    theme_classic2() +
+    theme(axis.title = element_text(size = 11),
+          legend.text = element_text(size = 11),
+          plot.title = element_text(hjust = 0.5, face = "bold"))
+
+})
+ma_plot_list
+```
+
+Strikingly, we see how that among the two most upregulated genes are [Cold Inducible RNA Binding Protein](https://www.genecards.org/cgi-bin/carddisp.pl?gene=CIRBP&keywords=CIRBP) (CIRBP) and [RNA Binding Motif Protein 3](https://www.genecards.org/cgi-bin/carddisp.pl?gene=RBM3&keywords=RBM3) (RBM3). These are RNA binding proteins that are the [master regulators of the cold shock response](https://www.sciencedirect.com/science/article/pii/S0304419X09000730?via%3Dihub). This is consistent with the fact that cells have to cope with a dramatic change in temperature. Moreover, we see an upregulation of translation initiation factors [EIF1](https://www.genecards.org/cgi-bin/carddisp.pl?gene=EIF1&keywords=EIF1) and [EIF1B](https://www.genecards.org/cgi-bin/carddisp.pl?gene=EIF1B), which is explained by the fact that this stress response is mediated at the [translational level](https://www.cell.com/molecular-cell/fulltext/S1097-2765(10)00756-2?_returnURL=https%3A%2F%2Flinkinghub.elsevier.com%2Fretrieve%2Fpii%2FS1097276510007562%3Fshowall%3Dtrue). Finally, we also visualize an upregulation of JUND, a bona-fide stress-response gene.
+
+Let us visualize how the expression of RBM3 and CIRBP changes with the type of sample processing (fresh, local or central). We refer the reader to the previous notebook for a full explanation of these categories:
+
+```{r}
+cll_rt$processing <- case_when(
+  cll_rt$time %in% c("0h", "2h") ~ "fresh", 
+  cll_rt$time %in% c("4h", "6h", "8h") ~ "local",
+  cll_rt$time == "24h" ~ "central"
+)
+cll_rt$processing <- factor(cll_rt$processing, levels = rev(c("fresh", "local", "central")))
+RidgePlot(cll_rt, features = c("CIRBP", "RBM3"), group.by = "processing", cols = rev(c("#999999", "#632c63", "#e4624e")))
+```
+
+We can clearly see that the dropout rate decreases and the signal increases in a time-dependent fashion.
+dropout rates fresh local central.
+
+As we are detecting the transcriptional programme of a cold-shock response, we hypothesize that there is a systematic downregulation in gene expression in time-biased cells, because cold diminishes the rate of biochemical reactions. Hence, we would expect a general decrease in transcription. We can visualize that as a decreased number of detected genes:
+
+```{r}
+df_supp_fig <- dplyr::select(cll_rt@meta.data, "processing", "nFeature_RNA")
+saveRDS(df_supp_fig, "results/R_objects/ggplots/dataframe_ngenesVSprocessing_cll.rds")
+n_genes_gg <- cll_rt@meta.data %>% 
+  ggplot(aes(time, nFeature_RNA, fill = time)) +
+  geom_boxplot() +
+  scale_fill_manual(values =  c("#999999", "#92e8df", "yellow2", "limegreen", "#632c63", "#e4624e")) +
+  labs(x = "", y = "# detected genes") +
+  theme_classic2() +
+  theme(legend.position = "none", 
+        axis.text.x = element_text(size = 11), 
+        axis.title.y = element_text(size = 12))
+n_genes_gg
+saveRDS(n_genes_gg, "results/R_objects/ggplots/boxplot_num_genes_vs_processing_cll.rds")
+```
+
+# Gene Ontology enrichment analysis
+To reduce the complexity of the list of DEG and gain more explanatory power, we proceed to compute an GO enrichment. We will take the intersection of the patient-specific DEG, and analyze separately up- and down-regulated genes:
+
+```{r}
+# Upregulated DEG
+deg_up <- purrr::map(dea_list, function(dea) {
+  dea <- filter(dea, avg_logFC > 0)
+  dea$gene[1:100]
+})
+deg_up <- Reduce(intersect, deg_up)
+deg_up_sub <- deg_up[1:20]
+
+# Downregulated DEG
+deg_down <- purrr::map(dea_list, function(dea) {
+  dea <- filter(dea, avg_logFC < 0)
+  dea$gene[1:100]
+})
+deg_down <- Reduce(intersect, deg_down)
+deg_down_sub <- deg_down[1:20]
+```
+
+We can now conduct the gene ontology enrichment with the [GOstats](https://academic.oup.com/bioinformatics/article-lookup/doi/10.1093/bioinformatics/btl567) package:
+
+```{r}
+top_list <- list(
+  down = dea_general$gene[dea_general$avg_logFC < 0], 
+  up = dea_general$gene[dea_general$avg_logFC > 0], 
+  universe = rownames(cll_rt)
+)
+top_entrez <- purrr::map(top_list, function(x) {
+  entrez <- AnnotationDbi::select(
+    x = org.Hs.eg.db, 
+    keys = x, 
+    keytype = "SYMBOL",
+    columns = "ENTREZID"
+  )$ENTREZID
+  entrez <- entrez[!is.na(entrez)]
+  entrez
+})
+top_go <- purrr::map(
+  top_entrez[c("down", "up")], 
+  get_GOenrichment, 
+  universe = top_entrez$universe
+)
+top_go <- purrr::map(top_go, function(go) {
+  selection <- go$Size >= 3 & go$Size <= 300 & go$Count >= 5 & go$OddsRatio > 2 & go$Pvalue < 0.05
+  go <- go[selection, ]
+  go[order(go$OddsRatio, decreasing = TRUE), ]
+})
+top_go$down <- top_go$down[top_go$down$Term %in% c("Fc receptor signaling pathway", "activation of immune response"), ]
+top_go$up <- top_go$up[top_go$up$Term %in% c("cellular response to oxygen levels", "negative regulation of transcription, DNA-templated"), ]
+top_go <- bind_rows(top_go, .id = "direction")
+top_go_gg <- top_go %>% 
+  mutate(direction = factor(direction, levels = c("up", "down")),
+         Term = factor(Term, levels = rev(top_go$Term))) %>% 
+  ggplot(aes(Term, -1 * log10(Pvalue), color = direction)) +
+    geom_segment(aes(x = Term, xend = Term, y = 0, yend = -1 * log10(Pvalue))) +
+    geom_point() +
+    scale_color_manual("", values = c("firebrick3", "dodgerblue3")) +
+    labs(x = "", y = "-log10 (p-value)", color = "") +
+    theme_light() +
+    coord_flip()
+saveRDS(object = top_go_gg, "results/R_objects/ggplots/lollipop_go_enrichment_pbmc.rds")
+# # Convert HGNC to entrez id
+# universe <- AnnotationDbi::select(
+#   x = org.Hs.eg.db, 
+#   keys = rownames(cll_rt), 
+#   keytype = "SYMBOL",
+#   columns = "ENTREZID"
+#   )$ENTREZID
+# deg_entrez <- purrr::map(list(up = deg_up, down = deg_down), function(signature) {
+#   entrez <- AnnotationDbi::select(
+#     x = org.Hs.eg.db, 
+#     keys = signature, 
+#     keytype = "SYMBOL",
+#     columns = "ENTREZID"
+#   )$ENTREZID
+#   entrez[!is.na(entrez)]
+# })
+# 
+# # Perform GO enrichment
+# go_results <- purrr::map(
+#   deg_entrez, 
+#   get_GOenrichment, 
+#   universe = universe, 
+#   return_GOHyperGResult = FALSE
+# )
+# go_results_filt <- purrr::map2(go_results, c(3, 3), function(go, count) {
+#   selection <- go$Size >= 3 & go$Size <= 200 & go$Count >= count & go$OddsRatio > 2 & go$Pvalue < 0.05
+#   go <- go[selection, ]
+#   go[order(go$OddsRatio, decreasing = TRUE), ]
+# })
+# deg_entrez$up %in% get("GO:0001659", revmap(org.Hs.egGO))
+# ####
+# 
+# cold_entrez <- map(list(up = cold_shock_up[1:25], down = cold_shock_down[1:25]), function(signature) {
+#   entrez <- AnnotationDbi::select(
+#     x = org.Hs.eg.db, 
+#     keys = signature, 
+#     keytype = "SYMBOL",
+#     columns = "ENTREZID"
+#   )$ENTREZID
+#   entrez
+# })
+# universe_entrez <- AnnotationDbi::select(
+#   x = org.Hs.eg.db,
+#   keys = rownames(cll_seu),
+#   keytype = "SYMBOL",
+#   columns = "ENTREZID"
+# )$ENTREZID
+# library(GOstats)
+# go_cold_shock <- map(
+#   cold_entrez, 
+#   get_GOenrichment, 
+#   universe = universe_entrez
+# )
+# go_cold_shock_filt <- map(go_cold_shock, function(go) {
+#   selection <- go$Size >= 3 & go$Size <= 300 & go$Count >= 2 & go$OddsRatio > 2 & go$Pvalue < 0.05
+#   go <- go[selection, ]
+#   go[order(go$OddsRatio, decreasing = TRUE), ]
+# })
+
+```
+
+Argue that we eliminate terms to get rid of GO redundancy.
+# Patient specificity
+
+```{r}
+deg_100 <- purrr::map(dea_list, ~ .x$gene[1:75])
+rownames_mat <- Reduce(union, deg_100)
+dea_list <- purrr::map(dea_list, function(dea) {
+  rownames(dea) <- dea$gene
+  dea
+})
+avg_logfc <- purrr::map(dea_list, ~ .x[rownames_mat, "avg_logFC"])
+dea_patients <- as.data.frame(avg_logfc)
+rownames(dea_patients) <- rownames_mat
+colnames(dea_patients) <- names(dea_list)
+dea_patients <- as.matrix(dea_patients)
+pheatmap(mat = dea_patients, cluster_rows = TRUE, cluster_cols = FALSE, fontsize_row = 8)
+```
+
+We observe that the direction of differential expression for every gene in the signature is constant across donors. Thus, we can conclude that the gene signatures are universal. Therefore, we can use this signature to create a score that we can use to correct biased datasets.
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
+
+
+
+
+
+
+
+
