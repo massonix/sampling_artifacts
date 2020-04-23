@@ -1,5 +1,5 @@
 ---
-title: "PBMC storage adjustment"
+title: "PBMC: Storage at 4ºC"
 author: "Ramon Massoni-Badosa"
 date: "10/21/2019"
 output: 
@@ -14,6 +14,7 @@ knitr::opts_chunk$set(echo = TRUE, out.width = "100%", fig.align='center',
                       message=FALSE, warning = FALSE)
 options(width = 1200)
 ```
+
 
 # Introduction
 The objective of this notebook is to assess if storing blood samples at 4ºC before cryopreservation yields better single-cell transcriptomes than storing them at room temperature (RT).
@@ -73,7 +74,7 @@ umap_temperature <- purrr::map(pbmc_l, function(seurat) {
   DimPlot(seurat, reduction = "umap", cols = c("#999999", "darkorange1", "#a5cded"))
 })
 umap_temperature
-saveRDS(umap_temperature$female, "results/R_objects/ggplots/umap_4C_pbmc.rds")
+# saveRDS(umap_temperature$female, "results/R_objects/ggplots/umap_4C_pbmc.rds")
 
 # tSNE
 tsne_temperature <- purrr::map(pbmc_l, function(seurat) {
@@ -81,10 +82,12 @@ tsne_temperature <- purrr::map(pbmc_l, function(seurat) {
   DimPlot(seurat, reduction = "tsne", cols = c("#999999", "darkorange1", "#a5cded"))
 })
 tsne_temperature
-saveRDS(tsne_temperature$female, "results/R_objects/ggplots/tsne_4C_pbmc.rds")
+# saveRDS(tsne_temperature$female, "results/R_objects/ggplots/tsne_4C_pbmc.rds")
 ```
 
 # Quantify mixability (kBET)
+
+Refer to previous notebooks to understand how kBET works.
 
 ```{r}
 pbmc_female <- pbmc_l$female
@@ -122,18 +125,21 @@ acceptance_rate_gg <- acceptance_rate_df %>%
           axis.title.y = element_text(size = 13), 
           legend.text = element_text(size = 11))
 acceptance_rate_gg
-saveRDS(
-  acceptance_rate_gg, 
-  "results/R_objects/ggplots/barplot_acceptance_rate_storage_pbmc.rds"
-)
+# saveRDS(
+#   acceptance_rate_gg, 
+#   "results/R_objects/ggplots/barplot_acceptance_rate_storage_pbmc.rds"
+# )
 ```
+
+As we can see qualitatively (tSNEs) and quantitatively (kBET), storing at 4ºC partially prevents the sampling time biases on single-cell gene expression profiles.
+
 
 # Differential Expression Analysis
 
 ```{r}
 Idents(pbmc_female) <- "temperature"
 pbmc_f_sub <- subset(pbmc_female, idents = c("fresh", "4ºC"))
-dea <- FindMarkers(pbmc_f_sub, ident.1 = "4ºC", test.use = "wilcox")
+dea <- FindMarkers(pbmc_f_sub, ident.1 = "4ºC", test.use = "wilcox", logfc.threshold = 0)
 dea <- rownames_to_column(dea, var = "gene")
 dea <- dplyr::mutate(dea, significance = ifelse(p_val_adj < 0.001, "sig", "no sig"))
 subset_data <- dplyr::filter(dea, avg_logFC > 0.9)
@@ -146,9 +152,12 @@ volcano <- dea %>%
     labs(x = "log (fold-change)", y = "-log10 (p-value)", color = "") +
     theme_classic()
 volcano
-saveRDS(volcano, "results/R_objects/ggplots/volcano_4ºC_pbmc.rds")
+# saveRDS(volcano, "results/R_objects/ggplots/volcano_4ºC_pbmc.rds")
 ```
 Overall, we detected a total of `r sum(dea$significance == "sig")` differential expressed genes (DEG), `r sum(dea$significance == "sig" & dea$avg_logFC > 0)` of which were upregulated and `r sum(dea$significance == "sig" & dea$avg_logFC < 0)` were downregulated.
+
+Among the up-regulated genes, we can find stress-related genes such as JUN, JUNB, FOS and NFKBIA. These genes have been related to other stresses, such as [collagenase-dependent tissue dissociation](https://www.nature.com/articles/nmeth.4437).
+
 
 # Session Information
 
