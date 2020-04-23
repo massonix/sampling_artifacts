@@ -1,5 +1,5 @@
 ---
-title: "Effect of Sampling Time"
+title: "PBMC: Effect of Sampling Time"
 author: "Ramon Massoni-Badosa"
 date: "10/20/2019"
 output: 
@@ -15,7 +15,9 @@ knitr::opts_chunk$set(echo = TRUE, out.width = "100%", fig.align='center',
 options(width = 1200)
 ```
 
+
 # Introduction
+
 The objective of this notebook is to test if the time required to cryopreserve a blood sample is a source of technical artifacts in single-cell RNA-seq (scRNA-seq) data. We will do so by computing and visualizing the 'mixability' of PBMC that were kept at varying times (0h, 2h, 8h, 24h, 48h) prior to freezing.
 
 ## Package loading
@@ -82,17 +84,19 @@ umaps_time
 tsnes_time <- purrr::map(
   pbmc_l, 
   DimPlot, 
-  reduction = "tsne", 
+  reduction = "tsne",
+  pt.size = 0.025,
   cols = palette
 )
 tsnes_time
-saveRDS(tsnes_time, "results/R_objects/ggplots/tsne_time_points_PBMC_Seuratv3.rds")
-saveRDS(pbmc_l$male, "results/R_objects/pbmc_Seurat_male.rds")
+# saveRDS(tsnes_time, "results/R_objects/ggplots/tsne_time_points_PBMC_Seuratv3.rds")
+# saveRDS(pbmc_l$male, "results/R_objects/pbmc_Seurat_male.rds")
 ```
 
 As we can see, within each cell type cells cluster by time.
 
 # Principal Component Analysis (PCA)
+
 Let us asses if, for each cell type, time is the major source of variance in the dataset:
 
 ```{r}
@@ -122,27 +126,74 @@ pc1_vs_time <- pbmc_types_pca %>%
     theme(legend.position = "none",
           axis.title.y = element_text(size = 13, face = "bold"))
 pc1_vs_time
-saveRDS(pc1_vs_time, "results/R_objects/ggplots/pc1_time_Seuratv3_gg.rds")
+# saveRDS(pc1_vs_time, "results/R_objects/ggplots/pc1_time_Seuratv3_gg.rds")
+```
+Let us compute the percentage of variance explained by PC1 out of all the variance explained by the first 50 principal components:
+
+```{r}
+pct_var_explained_dfs <- purrr::map(names(pbmc_types), function(type) {
+  eigen_values <- pbmc_types[[type]]@reductions$pca@stdev ^ 2
+  pct_var_explained <- eigen_values / sum(eigen_values) * 100
+  pct_var_explained_df <- data.frame(
+    pc = 1:length(pct_var_explained),
+    pct_var_explained = pct_var_explained
+  )
+  pct_var_explained_df
+})
+names(pct_var_explained_dfs) <- names(pbmc_types)
+pct_var_explained_df <- bind_rows(pct_var_explained_dfs, .id = "cell_type")
+pct_var_explained_df$cell_type <- factor(
+  pct_var_explained_df$cell_type,
+  levels = levels(pbmc$cell_type)
+)
+levels(pct_var_explained_df$cell_type) <- c("T-cell", "NK", "Monocyte", "B-cell")
+pct_var_gg <- pct_var_explained_df %>% 
+  ggplot(aes(pc, pct_var_explained, fill = cell_type)) +
+    geom_col() +
+    facet_grid(.~cell_type) +
+    labs(x = "Principal Component", y = "% variance") +
+    scale_x_continuous(labels = c(1, 10, 20, 30, 40, 50)) +
+    scale_fill_manual("", values = palette2) +
+    theme_classic() +
+    theme(axis.title = element_text(size = 13),
+          axis.text = element_text(size = 11, color = "black"),
+          strip.text = element_text(size = 13),
+          legend.position = "none")
+pct_var_gg
+ggsave(
+  filename = "results/plots/pct_variance_explained_pc1.pdf",
+  plot = pct_var_gg,
+  width = 12,
+  height = 9,
+  units = "cm"
+)
+# saveRDS(pct_var_gg, file = "results/R_objects/pct_variance_explained_pc1.rds")
 ```
 
 # Zoom-in into specific cell types
 
 ```{r}
-pbmc_types <- map(pbmc_types, function(seurat) {
+pbmc_types <- purrr::map(pbmc_types, function(seurat) {
   seurat$time <- seurat$condition
   seurat$time <- str_remove(seurat$time, "_RT")
   seurat$time <- factor(seurat$time, c("0h", "2h", "8h", "24h", "48h"))
   Idents(seurat) <- "time"
   seurat
 })
-pbmc_types <- map(pbmc_types, RunTSNE)
-tsne_types <- map(pbmc_types, DimPlot, reduction = "tsne", cols = c("#999999", "#92e8df", "#632c63", "#e4624e", "#c0e212"))
-saveRDS(tsne_types, "results/R_objects/ggplots/tsne_time_points_PBMC_cell_types_Seuratv3.rds")
+pbmc_types <- purrr::map(pbmc_types, RunTSNE)
+tsne_types <- purrr::map(
+  pbmc_types,
+  DimPlot,
+  reduction = "tsne",
+  cols = c("#999999", "#92e8df", "#632c63", "#e4624e", "#c0e212")
+)
+tsne_types
+# saveRDS(tsne_types, "results/R_objects/ggplots/tsne_time_points_PBMC_cell_types_Seuratv3.rds")
 ```
 
 # kBET
 
-To quantify the mixability between time-points, we will use the metric [kBET](https://www.nature.com/articles/s41592-018-0254-1). Intuitively, kBET quantifies as well-mixed those datasets for which most subsets of neareast neighbors have the same local batch distribution as the global of the dataset. The documentation of the package can be found [here](https://github.com/theislab/kBET).
+To quantify the mixability between time-points, we will use the metric [kBET](https://www.nature.com/articles/s41592-018-0254-1). Intuitively, kBET compares the proportion of k-nearest neighbors that belong to each time-point with the global distribution. We say that a dataset is well-mixed if the local neighborhood approximates the global. We will compute the mixability of each time-point with our control (0h). The documentation of the package can be found [here](https://github.com/theislab/kBET).
 
 ```{r}
 # Calculate rejection rates
@@ -179,7 +230,7 @@ rejection_rate_gg <- purrr::map(rejection_rate_df, function(df) {
       theme_classic()
 })
 rejection_rate_gg
-saveRDS(rejection_rate_gg, "results/R_objects/ggplots/barplot_rejection_rate_pbmc.rds")
+# saveRDS(rejection_rate_gg, "results/R_objects/ggplots/barplot_rejection_rate_pbmc.rds")
 ```
 
 # Session Information
