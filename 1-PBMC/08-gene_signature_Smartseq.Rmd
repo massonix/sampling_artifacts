@@ -563,7 +563,7 @@ explained_var <- plotExplanatoryVariables(
 )
 explained_var <- explained_var + 
   scale_color_discrete("", labels = c("time", "# detected genes", "library size")) +
-  theme(axis.title = element_text(size = 12, face = "bold"),
+  theme(axis.title = element_text(size = 12),
         legend.text = element_text(size = 11),
         axis.text = element_text(size = 10))
 
@@ -575,7 +575,7 @@ ggsave(
 )
 saveRDS(
   object = explained_var, 
-  file = str_c("results/R_objects//", date, "_explained_variability.rds")
+  file = str_c("results/R_objects/ggplots/explained_variability_smartseq.rds")
 )
 explained_var     
 ```
