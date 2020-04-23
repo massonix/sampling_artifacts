@@ -1,5 +1,5 @@
 ---
-title: "Computational Correction Cold Shock"
+title: "PBMC: Computational Correction Cold Shock"
 author: "Ramon Massoni-Badosa"
 date: "10/21/2019"
 output: 
@@ -17,7 +17,7 @@ options(width = 1200)
 
 # Introduction
 
-The objective of this notebook is to correct the cold-shock-biased transcriptomes of the PBMC is our dataset using the signature we obtained from the CLL diseased donors. Thus, the PBMC will serve as test set to elucidate the usability of this correction with real data. We will aim to remove the technical variability while preserving the biological
+The objective of this notebook is to create a cell-specific "cold-shock score" using the cold-shock transcriptomic signature. We will assess the potential of this score in predicting and correcting cold-shocked cells.
 
 # Pre-processing
 
@@ -97,7 +97,7 @@ pbmc_donor <- map(
   name = "cold_shock_score"
 )
 pbmc_donor <- purrr::map(pbmc_donor, function(seurat) {
-  seurat$cold_shock_score1 <- -1 * seurat$cold_shock_score1  
+  seurat$cold_shock_score1 <- -1 * seurat$cold_shock_score1
   seurat
 })
 
@@ -113,10 +113,12 @@ vln_cold_score <- vln_cold_score +
   theme(axis.text.x = element_text(angle = 0)) +
   theme(legend.position = "none")
 vln_cold_score
-saveRDS(vln_cold_score, "results/R_objects/ggplots/violin_cold_shock_score.rds")
+# saveRDS(vln_cold_score, "results/R_objects/ggplots/violin_cold_shock_score.rds")
 ```
 
 # Predict biased cells
+
+To predict cold-shocked cells, we will use a logistic regression, using cold-shock score as explanatory variable and the probability of being cold-shocked as the response variable. To learn more about logistic regression and how to apply it in R, I recomend the book ["Introduction to Statistical Learning"](https://faculty.marshall.usc.edu/gareth-james/ISL/ISLR%20Seventh%20Printing.pdf), by Gareth James and colleagues.
 
 ```{r}
 # Fit logistic regression model
@@ -177,11 +179,11 @@ auroc <- map_dbl(c("cold_shock_score", "random_score"), function(x) {
 })
 names(auroc) <- c("cold_shock_score", "random_score")
 auroc
-saveRDS(roc_gg, file = "results/R_objects/ggplots/roc_curve_pbmc.rds")
+# saveRDS(roc_gg, file = "results/R_objects/ggplots/roc_curve_pbmc.rds")
 ```
 
 # Regress Out
-Now, let us regress the expression of each gene on cold shock score. We will do this for each cell type separately to minimize [Simpson's paradox](https://ds.czbiohub.org/blog/Regression-Hazards/). Then, we will keep the residuals as the variability not explained by time:
+Now, let us regress the expression of each gene onto cold shock score. We will do this for each cell type separately to minimize [Simpson's paradox](https://ds.czbiohub.org/blog/Regression-Hazards/). Then, we will keep the residuals as the variability not explained by time:
 
 ```{r}
 seu <- pbmc_donor$female
@@ -215,19 +217,21 @@ pbmc_female2 <- RunTSNE(pbmc_female2, reduction = "pca", dims = 1:20)
 Idents(pbmc_female2) <- "time"
 umap_corrected <- DimPlot(pbmc_female2, reduction = "umap", cols = palette)
 tsne_corrected <- DimPlot(pbmc_female2, reduction = "tsne", cols = palette)
-ggarrange(plotlist = list(original_umap, umap_corrected), ncol = 2)
-saveRDS(
-  list(original = original_umap, corrected = umap_corrected), 
-  "results/R_objects/ggplots/umaps_original_correction_pbmc.rds"
-)
-saveRDS(
-  list(original = original_tsne, corrected = tsne_corrected), 
-  "results/R_objects/ggplots/tsnes_original_correction_pbmc.rds"
-)
+umap_corrected
+tsne_corrected
+# ggarrange(plotlist = list(original_umap, umap_corrected), ncol = 2)
+# saveRDS(
+#   list(original = original_umap, corrected = umap_corrected), 
+#   "results/R_objects/ggplots/umaps_original_correction_pbmc.rds"
+# )
+# saveRDS(
+#   list(original = original_tsne, corrected = tsne_corrected), 
+#   "results/R_objects/ggplots/tsnes_original_correction_pbmc.rds"
+# )
 ```
 
 # kBET
-To quantify the mixability between time-points, we will use the metric [kBET](https://www.nature.com/articles/s41592-018-0254-1). Intuitively, kBET quantifies as well-mixed those datasets for which most subsets of neareast neighbors have the same local batch distribution as the global of the dataset. The documentation of the package can be found [here](https://github.com/theislab/kBET).
+To quantify the mixability between time-points, we will use the metric [kBET](https://www.nature.com/articles/s41592-018-0254-1). Intuitively, kBET compares the proportion of k-nearest neighbors that belong to each time-point with the global distribution. We say that a dataset is well-mixed if the local neighborhood approximates the global. The documentation of the package can be found [here](https://github.com/theislab/kBET).
 
 ```{r}
 # Calculate rejection rates
@@ -266,7 +270,7 @@ acceptance_rates_gg <- acceptance_rates %>%
           axis.title.y = element_text(size = 13), 
           legend.text = element_text(size = 11))
 acceptance_rates_gg
-saveRDS(acceptance_rates_gg, "results/R_objects/ggplots/barplot_acceptance_rate_correction_pbmc.rds")
+# saveRDS(acceptance_rates_gg, "results/R_objects/ggplots/barplot_acceptance_rate_correction_pbmc.rds")
 ```
 
 
