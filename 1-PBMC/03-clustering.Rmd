@@ -1,20 +1,25 @@
 ---
-title: "Clustering"
+title: "PBMC: Clustering"
 author: "Ramon Massoni-Badosa"
 date: "2019/04/09"
+output: 
+  BiocStyle::html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
 ---
+
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, out.width = "100%", fig.align='center', 
                       message=FALSE, warning = FALSE)
 options(width = 1200)
 ```
 
-
 # Introduction
 
-In previous notebooks, we have assigned each cell to its condition (0h, 8h, etc.), we have filtered low-quality cells, and we have normalized gene counts to correct for biases such as differences in library size. The result of that is a `SingleCellExperiment` object that we saved as .RDS and that will be our starting point in this analysis.
+In previous notebooks, we have assigned each cell to its condition (0h, 8h, etc.), we have filtered low-quality cells, and we have normalized gene counts to correct for biases such as differences in library size. The result of that is a `SingleCellExperiment` object that we saved as .RDS and that will be the starting point of this analysis.
 
-Here, we aim to cluster cells to identify each cell type. Hence, we are going to use [Seurat](https://satijalab.org/seurat/), a CRAN package that has become a swiss-knife for scRNA-seq analysis. As described in [Kiselev *et al*](https://www.nature.com/articles/s41576-018-0088-9), Seurat uses a graph-based clustering algorithm that is scalable to datasets with thousands of cells. Therefore, we will leverage such scalability to cluster >11,000 cells contained in the SCE object.
+Here, we aim to cluster cells to identify each cell type. Hence, we are going to use [Seurat](https://satijalab.org/seurat/), a CRAN package that has become a swiss-knife for scRNA-seq analysis. As described in [Kiselev *et al*](https://www.nature.com/articles/s41576-018-0088-9), Seurat uses a graph-based clustering algorithm that is scalable to datasets with thousands of cells. Therefore, we will leverage such scalability to cluster >10,000 cells contained in the SCE object.
 
 ## Package loading
 
@@ -37,6 +42,7 @@ source("bin/utils.R")
 ```
 
 # Create seurat object
+
 Seurat uses its own single-cell data container, a so-called `Seurat` object. Hence, we first need to convert the SCE to this new data structure:
 
 ```{r}
@@ -57,34 +63,38 @@ rownames(sce)[ind] <- c("PNRC2.1", "SRSF10.1")
 # Convert SCE to Seurat
 seurat <- as.Seurat(sce)
 ```
+
 As we have two donors (male/female), we will annotate them separately.
 
 # Find Variable Genes
-To cluster our cells, we need to overcome 2 challenges:
+To cluster our cells, we need to overcome 3 challenges:
 
 1. The 'curse of dimensionality': as each cell can be conceived as a vector with >10,000 genes, and as two random cells will have most of each genes equal, the distance measured between any given pair of cells will be very low, thus being unreliable for proper comparisons.
 2. Computational complexity: as the data is highly dimensional, even the most greedy algorithm will take long to complete. 
 3. Most genes should not be differentially expressed between cells, so the observed differences in such genes will be due to technical issues or transient biological states, that may confound the true structure in the dataset.
 
-A first approach to tackle these challenges consists of finding the most variable genes as a means of feature selection. That is, to find the subset of genes that drive most of the variability in the expression matrix. Seurat calculates the average expression and dispersion for each gene. Then, it divides genes into bins based on its average, and for each bin computes a z-score per gene. Those genes with a z-score above a certain cutoff are categorized as highly variable. The binning step is vital, since genes with more UMI tend to have more dispersion.
+A first approach to tackle these challenges consists of finding the most variable genes in the dataset (feature extraction). That is, to find the subset of genes that drive most of the variability in the expression matrix. Seurat calculates the average expression and dispersion for each gene. Then, it divides genes into bins based on its average, and for each bin computes a z-score per gene. Those genes with a z-score above a certain cutoff are categorized as highly variable. The binning step is vital, since genes with more UMI tend to have more dispersion.
 
 ```{r}
 seurat_l <- SplitObject(seurat, split.by = "donor")
 seurat_l <- purrr::map(seurat_l, FindVariableFeatures)
 purrr::map(seurat_l, ~ length(VariableFeatures(.x)))
+purrr::map(seurat_l, VariableFeaturePlot)
 ```
 
-As we can see, we reduce the number of dimensions from >10,000 genes to 319 HVG.
+As we can see, we reduce the number of dimensions from >10,000 genes to 2000 HVG.
 
 # Scale data
-An important pre-processing step in any cluster analysis is to scale the data, as otherwise variables with a higher mean will have a higher weight in the distance metric. Remember that we observed batch effects, so we regress out the "batch" variable:
+
+An important pre-processing step in any cluster analysis is to scale the data, as otherwise variables with a higher mean will have a higher weight in the distance metric. We regress out the "batch" variable:
 
 ```{r}
 seurat_l <- purrr::map(seurat_l, ScaleData, vars.to.regress = "batch")
 ```
 
 # Linear dimensionality reduction (PCA)
-An additional challenge in our cluster analysis is that scRNAs-seq is very noisy (very susceptible to technical artifacts), and very sparse (contains drop-outs). Thus, differences in single genes may not be accurate to identify cell types. To that end, we can perform Principal Component Analysis, as PC can be conceived as a 'metagene' that includes information across a correlated gene set. Furthermore, we will reduce the dimensionality even more.
+
+An additional challenge in our cluster analysis is that scRNAs-seq is very noisy (very susceptible to technical artifacts), and very sparse (contains drop-outs). Thus, differences in single genes may not be accurate to identify cell types. To that end, we can perform PCA, in which each PC can be conceived as a 'metagene' that includes information across a correlated gene set. Furthermore, we will reduce the dimensionality even more.
 
 ```{r}
 seurat_l <- purrr::map(seurat_l, RunPCA)
@@ -93,14 +103,17 @@ purrr::map(seurat_l, PCHeatmap, dims = 1, balanced = TRUE)
 ```
 
 # Cluster cells
-Seurat uses the Louvain algorithm to cluster cells:
+
+Seurat uses the [Louvain algorithm](https://www.nature.com/articles/s41576-018-0088-9) to cluster cells:
 
 ```{r}
 seurat_l <- purrr::map(seurat_l, FindNeighbors, dims = 1:15)
 seurat_l <- purrr::map(seurat_l, FindClusters, resolution = 0.05)
 ```
 
+
 # Non-linear dimensionality reduction (UMAP/tSNE)
+
 We can visualize the former clusters with a t-Stochastic Neighbor Embedding (tSNE) and a Uniform Manifold Approximation and Projection (UMAP), which allow to depict more structure in the data than PCA:
 
 ```{r}
@@ -128,10 +141,13 @@ purrr::map(seurat_l, function(s) {
 Regressing out the batch effect with the `ScaleData` function from above removed the majority of the batch effect.
 
 # Find differentially expressed genes (cluster biomarkers)
+
 Let us find the markers of each of the clusters above. In other words, let us find which genes are exclusively expressed in each cluster and will help us identify the cell types in our data set:
 
 ```{r}
-markers <- purrr::map(seurat_l, FindAllMarkers)
+markers <- purrr::map(seurat_l, FindAllMarkers, only.pos = TRUE)
+DT::datatable(markers$male)
+DT::datatable(markers$female)
 saveRDS(markers, file = "results/R_objects/pbmc_markers_list.rds")
 marker_selection <- purrr::map2(seurat_l, markers, function(seurat, df) {
   num_k <- length(unique(seurat$seurat_clusters))
@@ -144,9 +160,12 @@ heatmaps_markers
 ```
 
 ## Assigning cell type identity to clusters
+
 Based on the previously found markers, we can annotate each cluster to known cell types:
 
+
 ## Male
+
 Cluster ID | Markers       | Cell Type
 -----------|---------------|----------
 0          | IL7R          | T cells
@@ -192,11 +211,44 @@ umap_annot
 umap_markers
 ```
 
+Let us summarise the number of cells per cell type statified by donor and temperature
+
+```{r}
+qc_cell_type_pbmc <- seurat@meta.data
+qc_cell_type_pbmc$temperature <- case_when(
+  qc_cell_type_pbmc$condition == "0h" ~ "0h",
+  qc_cell_type_pbmc$condition %in% c("2h", "8h", "24h_RT", "48h_RT") ~ "21ºC",
+  qc_cell_type_pbmc$condition %in% c("24h_4C", "48h_4C") ~ "4ºC"
+)
+qc_cell_type_pbmc$time <- qc_cell_type_pbmc$condition %>%
+  str_remove("_4C") %>%
+  str_remove("_RT")
+levels(qc_cell_type_pbmc$cell_type) <- c("T-cell", "NK", "Monocyte", "B-cell")
+qc_cell_type_pbmc <- qc_cell_type_pbmc %>%
+  mutate(time = factor(time, levels = c("0h", "2h", "8h", "24h", "48h")),
+         temperature = factor(temperature, levels = c("0h", "21ºC", "4ºC")),
+         donor = factor(donor, levels = c("male", "female"))) %>%
+  group_by(time, donor, temperature, cell_type) %>%
+  summarise(num_cells = n()) %>%
+  ungroup()
+colnames(qc_cell_type_pbmc)[4] <- "annotation"
+qc_cell_type_pbmc <- add_column(
+  qc_cell_type_pbmc,
+  experiment = rep("PBMC", nrow(qc_cell_type_pbmc)),
+  .after = 0
+)
+DT::datatable(qc_cell_type_pbmc)
+saveRDS(qc_cell_type_pbmc, "results/R_objects/qc_summary_table_cell_type_pbmc.rds")
+```
+
 # Save
 
 ```{r}
-saveRDS(seurat, "results/R_objects/10X_pbmc_Seurat_clustered.RDS")
-saveRDS(seurat_l, "results/R_objects/10X_pbmc_Seurat_donors_list_clustered.RDS")
+# saveRDS(seurat, "results/R_objects/10X_pbmc_Seurat_clustered.RDS")
+# saveRDS(seurat_l, "results/R_objects/10X_pbmc_Seurat_donors_list_clustered.RDS")
+
+
+
 # Recode variables
 # seurat <- colData(sce2)[, c("batch", "donor", "ident", "condition")]
 # conds <- c("0h", "2h", "8h", "24h_RT", "48h_RT", "24h_4C", "48h_4C")
