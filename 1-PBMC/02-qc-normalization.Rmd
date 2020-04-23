@@ -1,7 +1,12 @@
 ---
-title: "Quality Control and Normalization"
+title: "PBMC: Quality Control and Normalization"
 author: "Ramon Massoni-Badosa"
 date: "2019/04/08"
+output: 
+  BiocStyle::html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
 ---
 
 ```{r setup, include=FALSE}
@@ -63,7 +68,8 @@ head(colnames(colData(sce)), 10)
 ```
 
 ### Library size
-We first filter out cells that have a library size (total number of RNA molecules) too small in comparison with other cells. Such cells are likely to have broken or failed to capture. To determine the threshold, we can visualize the library size distribution with a histogram. As there are outliers with a great deal of counts, we will plot the log distribution:
+
+We first filter out cells that have a library size (total number of RNA molecules) too small in comparison with other cells. Such cells represent lysed cell or empty droplets. To determine the threshold, we can visualize the library size distribution with a histogram. As there are outliers with a great deal of counts, we will plot the log distribution:
 
 ```{r}
 x_titl <- expression("log"[10]*"(library size)")
@@ -83,7 +89,7 @@ lib_size_qc <- as.data.frame(colData(sce)) %>%
 lib_size_qc
 ```
 
-Based on the log distribution, we remove those cells with a library size lower than 10^2.85 = 707 UMI. These cells are likely cellular debris present in empty droplets. Moreover, we also filter cells with > 10,000 UMI, which are likely doublets. Notice that we are using data-driven filters which are based on the comparison between cells:
+Based on the log distribution, we remove those cells with a library size lower than 10^2.85 = 707 UMI. Moreover, we also filter cells with > 9,000 UMI, which are likely doublets:
 
 ```{r}
 table(sce$total_counts > 707 & sce$total_counts < 9000)
@@ -91,6 +97,7 @@ keep_lib_size <- sce$total_counts > 707 & sce$total_counts < 9000
 ```
 
 ### Cell coverage
+
 We next filter by the cell coverage, which is the number of detected genes in each cell (i.e., number of genes with non-zero counts for a given cell). We want to ensure that the reads are distributed across the transcriptome. Thus, we rule out those cells that have an abnormally low number of detected genes.
 
 ```{r}
@@ -128,7 +135,7 @@ cell_coverage_qc <- ggarrange(
 cell_coverage_qc
 ```
 
-According to the distribution, we remove those cells with a cell coverage lower than 350 detected genes:
+According to the distribution, we remove those cells with a cell coverage lower than 350 detected genes or higher than 2,000:
 
 ```{r}
 table(sce$total_features_by_counts > 350 & sce$total_features_by_counts < 2000)
@@ -136,6 +143,7 @@ keep_cell_cov <- sce$total_features_by_counts > 350 & sce$total_features_by_coun
 ```
 
 ### Mitochondrial genes
+
 The third cell filter we aim to apply is based on the percentage of counts of mitochondrial genes. It is expected that poor-quality cells are enriched for the expression of mitochondrial genes, likely because cells underwent apoptosis:
 
 ```{r}
@@ -161,42 +169,20 @@ table(sce$pct_counts_MT < 10)
 keep_mt <- sce$pct_counts_MT < 10
 ```
 
-## Visual inspection low quality cells
-After establishing the threshold for 3 QC metrics: library size, cell coverage and % of mitochondrial genes, we can classify cells as high and low quality. Note that, although there are cells that are outliers in all 3 metrics, we only require a cell to be an outlier in a single metric to be considered as low-quality:
+After establishing the threshold for the 3 QC metrics we can classify cells as high and low quality. Note that, although there are cells that are outliers in all 3 metrics, we only require a cell to be an outlier in a single metric to be considered as low-quality:
 
 ```{r}
 sce$is_high_quality <- keep_lib_size & keep_cell_cov & keep_mt
-```
-
-We aim to assess visually if low-quality cells are indeed outlier cells. To that end, we can run and plot a tSNE:
-
-```{r}
 sce$exclude <- !(sce$is_high_quality)
-cell_quality_tsne <- plot_tsne(
-  sce, 
-  exprs_values = "counts", 
-  color_by = "exclude", 
-  colors = c("gray62", "red2"),
-  point_size = 1.8,
-  point_alpha = 0.75
-)
-
-# Save tSNE
-ggsave(
-  filename = str_c("results/plots/", date, "_tsne_low_quality_cells.pdf"), 
-  plot = cell_quality_tsne,
-  device = "pdf",
-  width = 9,
-  height = 8
-)
-cell_quality_tsne
 ```
 
-Interestingly, the cells we classified as poor quality cluster together. There are a few cells classified as low-quality in clusters with a great deal of high-quality cells. Thus, if we applied more stringent cutoffs, we would start losing important biological information.
+
+## Joint QC
 
 As a final validation, it is important to analyse the QC metrics jointly. Particularly, if high mitochondrial expression is associated with a large library size, these would represent metabolically active cells, which we should keep:
 
 ```{r}
+# Number of detected genes VS library size
 qc_titles <- c("Library Size (total UMI)", "Number of detected genes", "% mitochondrial expression")
 joint_qc_gg <- colData(sce) %>% 
   as.data.frame() %>% 
@@ -211,23 +197,57 @@ joint_qc_gg <- colData(sce) %>%
     theme_classic()
 joint_qc_gg
 saveRDS(joint_qc_gg, file = "results/R_objects/ggplots/scatter_plot_joint_qc_pbmc.rds")
+
+# % mitochondrial expression VS library size
+mt_vs_lib <- colData(sce) %>% 
+  as.data.frame() %>% 
+  ggplot(aes(total_counts, pct_counts_MT)) +
+    geom_point(alpha = 0.5) +
+    geom_vline(xintercept = 707, linetype = "dashed", color = "red") +
+    geom_vline(xintercept = 10000, linetype = "dashed", color = "red") +
+    geom_hline(yintercept = 10, linetype = "dashed", color = "red") +
+    labs(x = qc_titles[1], y = qc_titles[3]) +
+    theme_classic()
+
+mt_vs_lib
 ```
 
 As we can see, the cells with the highest percentage of mitochondrial genes also have the lowest UMI.
 
 ## Cell filtering
-We proceed to filter out poor-quality cells:
 
 ```{r}
+# Data frame qc summary metrics
+qc_df <- as.data.frame(sce@colData)
+col_sel <- c("donor", "condition", "total_counts",
+             "total_features_by_counts", "pct_counts_MT")
+qc_df <- qc_df[, col_sel]
+qc_df$temperature <- case_when(
+  qc_df$condition == "0h" ~ "0h",
+  qc_df$condition %in% c("2h", "8h", "24h_RT", "48h_RT") ~ "21ºC",
+  qc_df$condition %in% c("24h_4C", "48h_4C") ~ "4ºC"
+)
+qc_df$time <- str_remove(qc_df$condition, "(_RT|_4C)")
+qc_df <- qc_df %>%
+  mutate(time = factor(time, levels = c("0h", "2h", "8h", "24h", "48h")),
+         temperature = factor(temperature, levels = c("0h", "21ºC", "4ºC")),
+         donor = factor(donor, levels = c("male", "female"))) %>%
+  group_by(time, temperature, donor) %>%
+  summarise(num_cells_before_qc = n(),
+            average_library_size = mean(total_counts),
+            average_num_detected_genes = mean(total_features_by_counts),
+            average_mitochondrial_fraction = mean(pct_counts_MT))
+DT::datatable(qc_df)
+
+# Filter
 table(sce$is_high_quality)
 sce <- sce[, sce$is_high_quality]
 sce
 ```
 
 ## Doublet Detection
-We will detect the doublets present in our dataset. We carry it out here because we will use [DoubletFinder](https://www.cell.com/cell-systems/fulltext/S2405-4712(19)30073-0?_returnURL=https%3A%2F%2Flinkinghub.elsevier.com%2Fretrieve%2Fpii%2FS2405471219300730%3Fshowall%3Dtrue), a tool that works with a fully processed Seurat object. 
 
-DoubetFinder simulates doublets by averaging the UMI of two real cells. It subsequently project the simulations and real cells in PCA space and computes a nearest neighbors graph. Doublets are identified as those cells that have a proportion of artificial neighbors (pAN) greater than what you would expect by chance.
+We will detect the doublets present in our dataset with [DoubletFinder](https://www.cell.com/cell-systems/fulltext/S2405-4712(19)30073-0?_returnURL=https%3A%2F%2Flinkinghub.elsevier.com%2Fretrieve%2Fpii%2FS2405471219300730%3Fshowall%3Dtrue). DoubetFinder simulates doublets by averaging the UMI of two real cells. It subsequently project the simulations and real cells in PCA space and computes a nearest neighbors graph. Doublets are identified as those cells that have a proportion of artificial neighbors (pAN) greater than what you would expect by chance.
 
 Note that different donors and temperatures were sequenced in different 10X lanes. Hence, as it is impossible to find doublets from two different sequencing libraries, we will split the object by library:
 
@@ -299,6 +319,34 @@ symbols <- rowData(sce)$name
 seurat <- subset(seurat, idents = "Singlet")
 sce <- as.SingleCellExperiment(seurat)
 rownames(sce) <- symbols
+
+# Redo QC summary for high-quality cells
+qc_df2 <- as.data.frame(sce@colData)
+col_sel <- c("donor", "condition", "total_counts",
+             "total_features_by_counts", "pct_counts_MT")
+qc_df2 <- qc_df2[, col_sel]
+qc_df2$temperature <- case_when(
+  qc_df2$condition == "0h" ~ "0h",
+  qc_df2$condition %in% c("2h", "8h", "24h_RT", "48h_RT") ~ "21ºC",
+  qc_df2$condition %in% c("24h_4C", "48h_4C") ~ "4ºC"
+)
+qc_df2$time <- str_remove(qc_df2$condition, "(_RT|_4C)")
+qc_df2 <- qc_df2 %>%
+  mutate(time = factor(time, levels = c("0h", "2h", "8h", "24h", "48h")),
+         temperature = factor(temperature, levels = c("0h", "21ºC", "4ºC")),
+         donor = factor(donor, levels = c("male", "female"))) %>%
+  group_by(time, temperature, donor) %>%
+  summarise(num_cells_after = n(),
+            average_library_size = mean(total_counts),
+            average_num_detected_genes = mean(total_features_by_counts),
+            average_mitochondrial_fraction = mean(pct_counts_MT))
+qc_df$num_cells_after_qc <- qc_df2$num_cells_after
+col_sel <- c("time", "temperature", "donor", "num_cells_before_qc",
+             "num_cells_after_qc", "average_library_size", "average_num_detected_genes",
+             "average_mitochondrial_fraction")
+qc_df <- qc_df[, col_sel]
+DT::datatable(qc_df)
+saveRDS(qc_df, file = "results/R_objects/qc_summary_table_pbmc.rds")
 ```
 
 # Gene QC
@@ -354,21 +402,24 @@ sce
 ```
 
 ## Identify highest expressed genes
+
 In addition, we want to assess which are the highest expressed genes. We expect it to be housekeeping genes, such as actin beta (ACTB).
 
 ```{r}
-highest_expr_genes <- plotHighestExprs(sce, feature_names_to_plot = "name")
+rowData(sce)$symbol <- rownames(rowData(sce))
+highest_expr_genes <- plotHighestExprs(sce, feature_names_to_plot = "symbol")
 highest_expr_genes
 ```
 
 
 # Normalization
+
 We want to correct for two biases:
 
 1. Library size: if cell A has twice the library size of cell B, we expect that, on average, every gene in cell A will have twice the number of counts of cell B.
 2. RNA composition: we assume that most genes in cell A are not over-expressed in cell B. However, due to dropout events this might not be the case, so that the genes expressed in cells with low RNA composition (low cell coverage) will tend to be biased towards overexpression.
 
-We will use the `scran` package to compute size factors for the count matrix and correct for the former biases:
+We will use the [`scran`](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-016-0947-7) package to compute size factors for the count matrix and correct for the former biases:
 
 ```{r}
 sce <- computeSumFactors(sce)
@@ -383,152 +434,34 @@ assays(sce)
 logcounts(sce)[1:6, 1:6]
 ```
 
-Interestingly, we see that the size factors correlate almost perfectly with the library size:
+Interestingly, we see that the size factors correlate with the library size, whilst the condition partially explains the scatter along the diagonal, like representing differential RNA composition as described in [here](https://osca.bioconductor.org/normalization.html):
 
 ```{r}
-plot(sizeFactors(sce) ~ sce$total_counts)
+scran_df <- data.frame(
+  total_counts = sce$total_counts,
+  size_factors = sizeFactors(sce),
+  condition = sce$condition
+)
+ggplot(scran_df, aes(total_counts, size_factors, color = condition)) +
+  geom_point(size = 0.1) +
+  labs(x = "Library Size (UMI)", y = "Size Factors") +
+  theme_classic()
 summary(lm(sizeFactors(sce) ~ sce$total_counts))
 ```
 
-Let us save all QC plots into a single figure:
 
-```{r}
-cumul_dis <- cumul_dis + 
-  ylab("Cumulative proportion \n of library")
-qc_gg_list <- list(
-  lib_size_qc, 
-  cell_coverage_hist, 
-  mt_genes_qc, 
-  cumul_dis, 
-  cell_quality_tsne, 
-  mean_expr_gg
-)
-qc_gg <- ggarrange(
-  plotlist = qc_gg_list,
-  nrow = 2, 
-  ncol = 3,
-  common.legend = TRUE,
-  labels = "auto"
-)
-ggsave(
-  plot = qc_gg, 
-  filename = str_c("results/plots/", date, "_quality_control.png"), 
-  device = "png", 
-  width = 12, 
-  height = 9
-)
-ggsave(
-  plot = qc_gg, 
-  filename = str_c("doc/figures/R/", date, "_quality_control.pdf"), 
-  device = "pdf", 
-  width = 19, 
-  height = 14.25,
-  units = "cm"
-)
-qc_gg
-```
-
-# Batch effect detection
-As we know, we have data from two different donors (male and female) and two different batches (JULIA_03 and JULIA_04). We need to assess whether that is introducing batch effects:
-
-
-```{r}
-# Find Highly Variable Genes (HVG)
-sce_var <- sce 
-fit_var <- trendVar(sce_var, use.spikes = FALSE) 
-decomp_var <- decomposeVar(sce_var, fit_var)
-top_hvgs <- order(decomp_var$bio, decreasing = TRUE)
-top_20_pct_hvgs <- top_hvgs[1:(0.2 * length(top_hvgs))]
-sce_var <- sce_var[top_20_pct_hvgs, ]
-
-# Run tSNE
-sce_var <- runTSNE(object = sce_var, exprs_values = "logcounts")
-
-# Create data frame and base plot
-tsne_df <- reducedDim(sce_var, "TSNE") %>% 
-  as.data.frame() %>% 
-  set_colnames(c("TSNE1", "TSNE2")) %>% 
-  mutate(batch = sce_var$batch, donor = sce$donor) 
-
-tsne <- ggplot(tsne_df, aes(TSNE1, TSNE2)) +
-  geom_point(size = 2) +
-  theme_bw() +
-  theme(panel.grid = element_blank())
-
-# Batch effect (batch&donor)
-tsne_batch <- tsne + 
-  geom_point(aes(color = batch)) +
-  scale_color_manual(values = c("#5f74a0", "#c18c69"))
-tsne_donor <- tsne + 
-  geom_point(aes(color = donor)) +
-  scale_color_manual(values = c("#a6599f", "#36c987"))
-
-tsne_batch
-tsne_donor
-```
-
-We see a clear batch effect. However as there is an overlapping between "batch" and "donor" (03-male, 04-female), we do not know which one of the two is introducing it. Let us condition one on the other and inspect what is the primary source of variability:
-
-```{r}
-# Batch conditioned on donor
-male_batch <- tsne_df %>% 
-  filter(donor == "male") %>% 
-  ggplot(aes(TSNE1, TSNE2, color = batch)) +
-    geom_point(size = 1.5) +
-    scale_color_manual(values = c("#5f74a0", "#c18c69")) +
-    ggtitle("Male") +
-    theme_bw() +
-    theme(panel.grid = element_blank(),
-          plot.title = element_text(hjust = 0.5))
-    
-female_batch <- tsne_df %>% 
-  filter(donor == "female") %>% 
-  ggplot(aes(TSNE1, TSNE2, color = batch)) +
-    geom_point(size = 1.5) +
-    scale_color_manual(values = c("#5f74a0", "#c18c69")) +
-    ggtitle("Female") +
-    theme_bw() +
-    theme(panel.grid = element_blank(), 
-          plot.title = element_text(hjust = 0.5))
-
-ggarrange(plotlist = list(male_batch, female_batch), ncol = 2, nrow = 1)
-
-# Donor conditioned on batch
-julia_03_tsne <- tsne_df %>% 
-  filter(batch == "JULIA_03") %>% 
-  ggplot(aes(TSNE1, TSNE2, color = donor)) +
-    geom_point(size = 1.5) +
-    scale_color_manual(values = c("#5f74a0", "#c18c69")) +
-    ggtitle("JULIA_03") +
-    theme_bw() +
-    theme(panel.grid = element_blank(),
-          plot.title = element_text(hjust = 0.5))
-    
-julia_04_tsne <- tsne_df %>% 
-  filter(batch == "JULIA_04") %>% 
-  ggplot(aes(TSNE1, TSNE2, color = donor)) +
-    geom_point(size = 1.5) +
-    scale_color_manual(values = c("#5f74a0", "#c18c69")) +
-    ggtitle("JULIA_04") +
-    theme_bw() +
-    theme(panel.grid = element_blank(), 
-          plot.title = element_text(hjust = 0.5))
-
-ggarrange(plotlist = list(julia_03_tsne, julia_04_tsne), ncol = 2, nrow = 1)
-```
-
-Indeed, we see how both variables introduce variability in the data. In downstream analysis, we will separate male and female and treat them as biological replicates. Furthermore, we will introduce "batch" as a covariate in the analysis. 
+**Important note:** in our experience, different versions of `scran` yield slightly different logcounts. As the logcounts slot is the input to virtually every analysis downstream, the values might not reproduce exactly, although the results and conclusions should remain unchanged.
 
 # Save filtered and normalized SingleCellExperiment object
 
 We have our SCE filtered and normalized. We can now select the columns of interest in the colData and rowData slots, and then save the object as .RDS file to use in future analysis.
 
 ```{r}
-colData(sce) <- colData(sce)[, c("batch", "donor", "condition")]
-saveRDS(
-  sce, 
-  file = "results/R_objects/10X_SingleCellExperiment_filt&norm.RDS"
-)
+# colData(sce) <- colData(sce)[, c("batch", "donor", "condition")]
+# saveRDS(
+#   sce, 
+#   file = "results/R_objects/10X_SingleCellExperiment_filt&norm.RDS"
+# )
 ```
 
 # Session Info
