@@ -1,5 +1,5 @@
 ---
-title: "Effect Sampling Time on CLL scRNA-seq profiles"
+title: "CLL: Effect of Sampling Time on CLL scRNA-seq profiles"
 author: "Ramon Massoni-Badosa"
 date: "7/16/2019"
 output: 
@@ -16,7 +16,7 @@ options(width = 1200)
 ```
 
 # Introduction
-We now have a Seurat object demultiplexed, filtered, normalized and annotated. The objective of this notebook is to assess the effect of sampling time on the single-cell transcriptomes of chornic lymphocytic leukemia (CLL) cells.
+We now have a Seurat object demultiplexed, filtered, normalized and annotated. The objective of this notebook is to assess the effect of sampling time on the single-cell transcriptomes of chronic lymphocytic leukemia (CLL) cells.
 
 # Pre-processing
 
@@ -61,15 +61,15 @@ As we have eliminated the variability associated with temperature from the datas
 ```{r}
 # Seurat pipeline
 cll_rt <- pre_process_seurat(cll_rt)
-saveRDS(cll_rt, "results/R_objects/cll_seurat_fig1.rds")
+# saveRDS(cll_rt, "results/R_objects/cll_seurat_fig1.rds")
 
 # Visualize UMAP and tSNE
 Idents(cll_rt) <- "time"
-umap_rt <- DimPlot(cll_rt, reduction = "umap", cols = viridis(6))
+umap_rt <- DimPlot(cll_rt, reduction = "umap", cols = viridis(6), pt.size = 0.001)
 umap_rt <- umap_rt + labs(x = "UMAP1", y = "UMAP2")
 tsne_rt <- DimPlot(cll_rt, reduction = "tsne", pt.size = 1.5, cols = viridis(6))
 tsne_rt <- tsne_rt + labs(x = "tSNE1", y = "tSNE2")
-saveRDS(umap_rt, file = "results/R_objects/ggplots/umap_RT_CLL.rds")
+# saveRDS(umap_rt, file = "results/R_objects/ggplots/umap_RT_CLL.rds")
 umap_rt
 tsne_rt
 ```
@@ -92,7 +92,7 @@ names(cll_rt_l) <- c("1220", "1472", "1892")
 
 As we do every time we subset a dataset, we will rerun the pipeline:
 
-```{r}
+```{r fig.wide=TRUE}
 cll_rt_l <- map(cll_rt_l, pre_process_seurat)
 umap_rt_l <- map2(cll_rt_l, c(5, 6, 6), function(seurat, n_colors) {
   Idents(seurat) <- "time"
@@ -112,11 +112,11 @@ umap_rt_l <- ggarrange(
 umap_rt_l
 ```
 
-We observe the same gradient as above. Of note though, the structure of the three datasets is different. Specifically, donors 1472 and 1892 show an enhanced heterogeneity besides that explained by time; whilst donor 1220 shows a single 'blob'. This differences are explained by (1) the characteristic interpatient heterogeneity in cancer and (2) the fact that donor 1220 was sequenced not as deep as the other two. Also, note that we do not have time-point 0h for donor 1220.
+We observe the same gradient as above. Of note though, the structure of the three datasets is different. Specifically, donors 1472 and 1892 show an enhanced heterogeneity besides that explained by time; whilst donor 1220 shows a single 'blob'. This differences are explained by (1) the characteristic interpatient heterogeneity in cancer and (2) the fact that donor 1220 was sequenced more shallowly the other two. Also, note that we do not have time-point 0h for donor 1220.
 
-Let us now find the clusters for each CLL donor. We seek to elucidate if the different sampling times can be categorized in a similar fashion for each donor. As different donors present different structures, we need to tailor the resolutions
+Let us now find the clusters for each CLL donor. As different donors present different structures, we need to tailor the resolutions
 
-```{r}
+```{r fig.wide=TRUE}
 cll_rt_l <- map2(cll_rt_l, c(0.11, 0.15, 0.12), function(seurat, res) {
   seurat %>% 
     FindNeighbors() %>% 
@@ -135,7 +135,7 @@ umap_k_l
 
 We can plot the distribution of time-points for each cluster:
 
-```{r}
+```{r fig.wide=TRUE}
 stacked_barplots <- map2(cll_rt_l, c(5, 6, 6), function(seurat, n_colors) {
   pct_df <- seurat@meta.data %>% 
     select("seurat_clusters", "time") %>% 
@@ -166,7 +166,7 @@ stacked_barplots
 To interpret these plots, first we need to take into account how we can conceptualize the different time-points. As described in the [UK biobank sample handling and storage protocols](https://academic.oup.com/ije/article/37/2/234/789028), samples can be processed locally or centrally:
 
 - Local processing(<=8h): this is the case in which blood samples are collected in the same hospital, they are left at RT for several hours and, after a batch is complete, a technician cyropreserves it .
-- Central processing (>8h): the paradigmatic case of this is in multicentric studies, whereby blood samples are collected in a hospital and they are stored and shipped to another hospital where it will be processed.
+- Central processing (>8h): the paradigmatic case of this is in multicentric studies, whereby blood samples are collected in a hospital and they are stored and shipped to another hospital where they will be processed.
 
 We also have the case of 0-2h, which we consider as "fresh" samples and they represent our gold-standard. The case that better recapitulates these categories is the donor 1472, in which the main cluster divides into 3 clusters: C0 consists mainly of fresh cells (0h, 2h), C1 of locally-processed-like cells (4h, 6h, 8h), and C2 of centrally-processed cells (24h). On the other hand, we also see a smaller cluster (C3) that depicts that consists of cells of all time-points and likely represents a CLL subclone.
 
@@ -211,7 +211,7 @@ In light of the above, we can conclude that processing time at RT is a unviersal
 # Save list of Seurat objects
 
 ```{r}
-saveRDS(cll_rt_l, file = "results/R_objects/cll_rt_seurat_list.rds")
+# saveRDS(cll_rt_l, file = "results/R_objects/cll_rt_seurat_list.rds")
 ```
 
 # Session Info
