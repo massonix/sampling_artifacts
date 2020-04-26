@@ -1,5 +1,5 @@
 ---
-title: "Demultiplexing T cell activation"
+title: "Demultiplexing T cell activation experiment"
 author: "Ramon Massoni-Badosa"
 date: "10/7/2019"
 output: 
@@ -16,12 +16,14 @@ options(width = 1200)
 ```
 
 # Introduction
+
 Previously, we observed that time at room temperature (RT) prior to cryopreservation is a source of technical artifacts in blood-based single-cell RNA-seq (scRNA-seq) data. In this suproject, we aim to assess if culturing PBMCs after thawing them and before sequencing can remove the cold-shock signature.
 
 # Description of the data
-To that end, we drew blood from two healthy donors (3 males and 1 female) and cryopreserved the samples after 0h (fresh), 8h or 24h at RT. Subsequently, we thawed the samples and either processed them immediately with [10X Chromium](https://www.nature.com/articles/ncomms14049) (day 0), or after 2 days of cell culture (day 2). To eliminate batch effect, detect doublets and reduce the library cost, we used the [cell hashing protocol](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-018-1603-1), in which each condition (in our case time-points) is labeled with an antibody against ubiquitous cell surface markers that is crosslinked with a sample-specific hashtag oligonucleotide (HTO), that is sequenced together with the cDNA libraries. Thus, we have the following libraries:
 
-- Day 0: multiplexed with the two donors (male/female), and the 3 time-points per donor (0, 8, 24h). Note that this will serve as another replicate of the very first experiment we did.
+To that end, we drew blood from four healthy donors (3 males and 1 female) and cryopreserved the samples after 0h (fresh), 8h or 24h at RT. Subsequently, we thawed the samples and either processed them immediately with [10X Chromium](https://www.nature.com/articles/ncomms14049) (day 0), or after 2 days of cell culture (day 2). To eliminate batch effects, detect doublets and reduce the library cost, we performed [cell hashing ](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-018-1603-1). In this protocol, each condition (in our case time-points) is labeled with a specific hashtag oligonucleotide (HTO) that is crosslinked with an antibody. The antibodies bind to ubiquitous cell surface markers, and the HTO are sequenced alongside the single-cell gene expression libraries. We have the following libraries:
+
+- Day 0: multiplexed with the two donors (male/female1 OR female2/female3), and the 3 time-points per donor (0, 8, 24h).
 - Day 1/2: same as before but after 1 (BCLLATLAS_14 experiment) or 2 (BCLLATLAS_11) days in culture. Moreover, T cells were activated with anti-CD3 antibodies.
 
 ### Objective
@@ -97,7 +99,12 @@ We can visualize the results as ridge plots or heatmaps:
 ```{r}
 ridge_l <- map(t_act_list, function(t_act) {
   Idents(t_act) <- "HTO_maxID"
-  RidgePlot(t_act, assay = "HTO", features = rownames(t_act[["HTO"]])[1:6], ncol = 3)
+  RidgePlot(
+    t_act,
+    assay = "HTO",
+    features = rownames(t_act[["HTO"]])[1:6],
+    ncol = 2
+  )
 })
 
 heatmap_l <- map(t_act_list, function(t_act) {
@@ -105,26 +112,30 @@ heatmap_l <- map(t_act_list, function(t_act) {
 })
 
 # Save
-walk2(ridge_l, names(ridge_l), function(ridge, lib) {
-  ggsave(
-    filename = str_c("results/plots/", lib, "_hashtag_demux_ridge.pdf"),
-    plot = ridge, height = 9, 
-    width = 16
-  )
-})
-walk2(heatmap_l, names(heatmap_l), function(heat, lib) {
-  pdf(file = str_c("results/plots/", lib, "_hashtag_demux_heatmap.pdf"), height = 4, width = 7)
-  print(heat)
-  dev.off()
-})
+# walk2(ridge_l, names(ridge_l), function(ridge, lib) {
+#   ggsave(
+#     filename = str_c("results/plots/", lib, "_hashtag_demux_ridge.pdf"),
+#     plot = ridge, height = 9, 
+#     width = 16
+#   )
+# })
+# walk2(heatmap_l, names(heatmap_l), function(heat, lib) {
+#   pdf(file = str_c("results/plots/", lib, "_hashtag_demux_heatmap.pdf"), height = 4, width = 7)
+#   print(heat)
+#   dev.off()
+# })
+```
+```{r fig.wide=TRUE, fig.height=15}
 ridge_l
+```
+```{r fig.wide=TRUE}
 heatmap_l
 ```
 
 # Save Seurat objects
 
 ```{r}
-saveRDS(t_act_list, "results/R_objects/t_act_Seurat_list_demultiplexed.rds")
+# saveRDS(t_act_list, "results/R_objects/t_act_Seurat_list_demultiplexed.rds")
 ```
 
 # Session Info
