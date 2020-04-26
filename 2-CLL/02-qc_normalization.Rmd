@@ -1,5 +1,5 @@
 ---
-title: "Quality Control & Normalization"
+title: "CLL: Quality Control & Normalization"
 author: "Ramon Massoni-Badosa"
 date: "15/7/2019"
 output: 
@@ -263,33 +263,53 @@ joint_qc_gg +
 Of note, we can compare the proportion of poor quality cells across conditions
 ```{r}
 cll_seu$is_low_quality <- is_poor_quality
-poor_cond_gg <- cll_seu@meta.data %>% 
+qc_df <- cll_seu@meta.data
+qc_df$temperature <- case_when(
+  qc_df$temperature == "4C" ~ "4ºC",
+  qc_df$temperature == "RT" & qc_df$time == "0h" ~ "0h",
+  qc_df$temperature == "RT" & qc_df$time != "0h" ~ "21ºC"
+)
+qc_df <- qc_df %>%
+  mutate(time = factor(time, levels = c("0h", "2h", "4h", "6h", "8h", "24h")),
+         temperature = factor(temperature, levels = c("0h", "21ºC", "4ºC")),
+         donor = factor(donor, levels = c("1220", "1472", "1892"))) %>%
   group_by(donor, temperature, time) %>% 
-  summarise(pct_poor_cells = mean(is_low_quality) * 100) %>% 
+  summarise(pct_poor_cells = mean(is_low_quality) * 100,
+            num_cells_before_qc = n(),
+            average_library_size = mean(nCount_RNA),
+            average_num_detected_genes = mean(nFeature_RNA),
+            average_mitochondrial_fraction = mean(percent_mt))
+poor_cond_gg <- qc_df %>% 
   ggplot(aes(time, pct_poor_cells, fill = temperature)) +
-  geom_col(position = "dodge") +
-  facet_wrap(~donor) +
-  scale_fill_manual("", values = c("#a5cded", "#ed9121"),
-                    labels = c("4ºC", "18ºC")) +
-  labs(x = "", y = "% poor-quality cells", color = "") +
-  theme_classic2() + 
-  theme(axis.title.y = element_text(face = "bold", size = 10))
+    geom_col(position = "dodge") +
+    facet_wrap(~donor) +
+    scale_fill_manual("", values = c("gray", "#ed9121", "#a5cded")) +
+    labs(x = "", y = "% poor-quality cells", color = "") +
+    theme_classic2() + 
+    theme(axis.title.y = element_text(face = "bold", size = 10))
 poor_cond_gg
+col_sel <- c("time", "temperature", "donor", "num_cells_before_qc",
+             "average_library_size", "average_num_detected_genes",
+             "average_mitochondrial_fraction")
+qc_df <- qc_df[, col_sel]
+DT::datatable(qc_df)
+# saveRDS(qc_df, file = "results/R_objects/qc_summary_table_cll.rds")
 ```
 
 We observe that, in general, 4ºC cells have a lower quality than those at RT.
 
 ## Cell filtering
-In light of the above, we will discard `r table(is_poor_quality)` cells:
+In light of the above, we will discard `r table(is_poor_quality)[as.logical(names(table(is_poor_quality)))]` cells:
 
 ```{r}
+table(is_poor_quality)
 cll_seu <- subset(cll_seu, subset = is_low_quality == FALSE)
 cll_seu
 ```
 
 # Gene QC
 
-Let us compute the number of cells that each gene has at least 1 UMI:
+Let us compute the number of cells expressing each gene:
 
 ```{r}
 n_cells <- rowSums(as.matrix(cll_seu[["RNA"]]@counts) > 0)
@@ -302,7 +322,7 @@ gene_qc_gg <- n_cells %>%
 gene_qc_gg
 ```
 
-We see two peaks, the first one of which corresponds to lowly expressed genes. As explained in [Luecken MD et al.](https://www.embopress.org/doi/pdf/10.15252/msb.20188746): "a guideline to setting this threshold is to use the minimum cell cluster size that is of interest and leaving some leeway for dropout effects". As we will not rely on clusters that have fewer than 15 cells, we will use it as a filter:
+We see two peaks, the first one of which corresponds to lowly expressed genes. As explained in [Luecken MD *et al*.](https://www.embopress.org/doi/pdf/10.15252/msb.20188746): "a guideline to setting this threshold is to use the minimum cell cluster size that is of interest and leaving some leeway for dropout effects". As we will not rely on clusters that have fewer than 15 cells, we will use it as a filter:
 
 ```{r}
 gene_qc_gg +
@@ -329,24 +349,9 @@ To confidently compare gene expression between cells, we need to correct for two
 - Differences in library size: if one cell has more total counts than another due to sampling effects, genes that are equally expressed will show up as upregulated.
 - Between-sample systematic biases: if two conditions/donors were sequenced at different depths or in different batches, there might be compositional biases between conditions that yield a systematic up- or down-regulation.
 
-To correct for both, we will use the [`scran` package](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-016-0947-7)  which according to both a [recent](https://www.nature.com/articles/nmeth.4292) and an [old](https://www.biorxiv.org/content/10.1101/583013v2.full) review is the most robust method for scRNA-seq data normalization:
+To correct for both, we will use the [`scran` package](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-016-0947-7), as according to both [Vieth B, *et al*](https://www.nature.com/articles/s41467-019-12266-7) and [Vallejos CA, *et al*.](https://www.nature.com/articles/nmeth.4292), it is the most robust method for scRNA-seq data normalization:
 
 ```{r}
-# Note: this needs to be run, as this is the best normalization method (explained above). However, it needs to be run on the cluster which, does not work at the moment. Thus, we run scran without quickcluster.
-# clusters <- quickCluster(
-#   cll_sce, 
-#   use.ranks = FALSE, 
-#   block = factor(cll_sce$donor), 
-#   BPPARAM = MulticoreParam(4),
-#   block.BPPARAM = MulticoreParam(4)
-# )
-# cll_sce <- computeSumFactors(cll_sce, cluster = clusters, BPPARAM =  MulticoreParam(4))
-# summary(sizeFactors(cll_sce))
-# cll_sce <- normalize(cll_sce)
-# assays(cll_sce)
-# logcounts(cll_sce)[1:6, 1:6]
-# plot(sizeFactors(cll_sce) ~ cll_sce$total_counts)
-# saveRDS(object = cll_sce, file = "results//R_objects/cll_seurat_filtered_to_normalize.rds")
 cll_sce <- computeSumFactors(cll_sce)
 summary(sizeFactors(cll_sce))
 assays(cll_sce)
@@ -369,7 +374,7 @@ lm_size_fact <- lm(size_fact ~ lib_size, data = size_fact_df)
 summary(lm_size_fact)
 ```
 
-As we can see, 93.36% of the variation in scran's size factors is explained by the library size, so we can conclude that there is a strong positive correlation between both. Moreover, the remaining variation (scatter along the regression line) is explained by the different donor. As we saw above, donors 1472 and 1892 were deeper sequenced than 1220. All in all, this validates that scran is normalizing by the two major biases explained above.
+As we can see, `r summary(lm_size_fact)$r.squared * 100` of the variation in scran's size factors is explained by the library size, so we can conclude that there is a strong positive correlation between both. Moreover, the remaining variation (scatter along the regression line) is explained by the different donor. As we saw above, donors 1472 and 1892 were deeper sequenced than 1220. All in all, this validates that scran is normalizing by the two major biases explained above.
 
 # Save Seurat object
 
@@ -378,7 +383,7 @@ Finally, we can convert it back to seurat and save it as a compressed .RDS file 
 
 ```{r}
 cll_seu <- as.Seurat(cll_sce)
-saveRDS(cll_seu, "results/R_objects/cll_seurat_filtered_normalized.rds")
+# saveRDS(cll_seu, "results/R_objects/cll_seurat_filtered_normalized.rds")
 ```
 
 # Session Info
