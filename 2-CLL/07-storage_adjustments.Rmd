@@ -1,5 +1,5 @@
 ---
-title: "CLL storage adjustment"
+title: "CLL: Storage at 4ºC"
 author: "Ramon Massoni-Badosa"
 date: "10/21/2019"
 output: 
@@ -14,6 +14,7 @@ knitr::opts_chunk$set(echo = TRUE, out.width = "100%", fig.align='center',
                       message=FALSE, warning = FALSE)
 options(width = 1200)
 ```
+
 
 # Introduction
 The objective of this notebook is to assess if storing blood samples at 4ºC before cryopreservation yields better single-cell transcriptomes than storing them at room temperature (RT).
@@ -39,7 +40,6 @@ source("bin/utils.R")
 ```
 
 ## Load data
-We dispose of a demultiplexed, filtered, normalized and annotated Seurat object that contains the transcriptome and metadata of >30,000 Chronic Lymphocytic Leukemia (CLL) cells from two donors (male/female) that were kept at varying times at RT (0h, 2h, 8h, 24h, 48h).
 
 ```{r}
 cll <- readRDS("results/R_objects/cll_seurat_annotated.rds")
@@ -63,7 +63,7 @@ umap_temperature <- DimPlot(
   cols = c("#999999", "darkorange1", "#a5cded")
 )
 umap_temperature
-saveRDS(umap_temperature, "results/R_objects/ggplots/umap_4C_CLL.rds")
+# saveRDS(umap_temperature, "results/R_objects/ggplots/umap_4C_CLL.rds")
 
 # tSNE
 cll_sub <- RunTSNE(cll_sub, reduction = "pca", dims = 1:15)
@@ -73,10 +73,11 @@ tsne_temperature <- DimPlot(
   cols = c("#999999", "darkorange1", "#a5cded")
 )
 tsne_temperature
-saveRDS(tsne_temperature, "results/R_objects/ggplots/tsne_4C_CLL.rds")
+# saveRDS(tsne_temperature, "results/R_objects/ggplots/tsne_4C_CLL.rds")
 ```
 
 # Quantify mixability (kBET)
+
 
 ```{r}
 temperatures <- c("RT", "4ºC")
@@ -112,10 +113,10 @@ acceptance_rate_gg <- acceptance_rate_df %>%
           axis.title.y = element_text(size = 13), 
           legend.text = element_text(size = 11))
 acceptance_rate_gg
-saveRDS(
-  acceptance_rate_gg, 
-  "results/R_objects/ggplots/barplot_acceptance_rate_storage_cll.rds"
-)
+# saveRDS(
+#   acceptance_rate_gg, 
+#   "results/R_objects/ggplots/barplot_acceptance_rate_storage_cll.rds"
+# )
 ```
 
 # Differential Expression Analysis
@@ -135,6 +136,7 @@ dea <- dea %>%
   ungroup()
 dea <- rbind(dea[dea$direction == "down-regulated", ], dea[dea$direction == "up-regulated", ])
 dea$gene <- factor(dea$gene, levels = dea$gene)
+DT::datatable(dea)
 dea_gg <- dea %>% 
   ggplot(aes(gene, log10_pvalue, color = direction)) +
     geom_segment(aes(x = gene, xend = gene, y = 0, yend = log10_pvalue)) +
@@ -144,7 +146,7 @@ dea_gg <- dea %>%
     theme_light() +
     coord_flip()
 dea_gg
-saveRDS(dea_gg, "results/R_objects/ggplots/lollipop_plot_4ºC_cll.rds")
+# saveRDS(dea_gg, "results/R_objects/ggplots/lollipop_plot_4ºC_cll.rds")
 ```
 
 # Session Information
