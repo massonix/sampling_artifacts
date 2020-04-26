@@ -1,19 +1,29 @@
 ---
-title: "Computational Correction Cold-Shock Signature"
+title: "CLL: Computational Correction Cold-Shock Signature"
 author: "Ramon Massoni-Badosa"
 date: "10/4/2019"
-output: html_document
+output: 
+  BiocStyle::html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(echo = TRUE, out.width = "100%", fig.align='center', 
+                      message=FALSE, warning = FALSE)
+options(width = 1200)
 ```
 
 # Introduction
-The objective of this notebook is to correct the cold-shock transcriptional signature from the CLL scRNA-seq dataset to correct for the technical artifact introduced by sampling time while presarving the biological variation.
+
+The objective of this notebook is to correct the cold-shock transcriptional signature from the CLL scRNA-seq dataset to correct for the technical artifact introduced by sampling time while presarving the biological variation. We will follow a similar approach to the one we used for healthy PBMC.
+
+# Pre-processing
+
+## Package loading
 
 ```{r}
-# Load packages
 library(scater)
 library(scran)
 library(Seurat)
@@ -28,27 +38,43 @@ library(ggrepel)
 library(viridis)
 library(pheatmap)
 library(tidyverse)
+```
 
-# Source script with functions
+
+## Source script with functions
+
+```{r}
 source("bin/utils.R")
+```
 
-# Load data
+## Load data
+
+```{r}
 cll_rt_l <- readRDS("results/R_objects/cll_rt_seurat_list.rds")
 dea_list <- readRDS("results/R_objects/dea_results_per_patient.rds")
+```
 
-# Merge Seurat objects
+## Merge Seurat objects
+
+```{r}
 cll_merged <- merge(x = cll_rt_l$`1220`, y = cll_rt_l$`1472`, add.cell.ids = c("1220", "1472"))
 cll_merged$time <- factor(cll_merged$time, levels = c("0h", "2h", "4h", "6h", "8h", "24h"))
+```
+
+
+# Calculate cold-shock signature
+
+```{r}
 Idents(cll_merged) <- "time"
 cll_merged <- pre_process_seurat(cll_merged)
 original_umap <- DimPlot(cll_merged, reduction = "umap", cols = viridis(6), pt.size = 0.75)
 original_umap
-ggsave(
-  filename = "results/plots/uncorrected_umap.pdf", 
-  plot = original_umap, 
-  width = 10, 
-  height = 9
-)
+# ggsave(
+#   filename = "results/plots/uncorrected_umap.pdf", 
+#   plot = original_umap, 
+#   width = 10, 
+#   height = 9
+# )
 
 # Find cold shock signature
 cold_shock_signature <- dea_list$`1892`$gene[dea_list$`1892`$avg_logFC > 0][1:200]
@@ -57,12 +83,12 @@ cold_shock_signature <- dea_list$`1892`$gene[dea_list$`1892`$avg_logFC > 0][1:20
 cll_merged <- AddModuleScore(cll_merged, features = list(cold_shock_signature), name = "cold_shock_score")
 umap_cold_shock_score <- FeaturePlot(cll_merged, features = "cold_shock_score1", cols = viridis(20), pt.size = 0.75)
 umap_cold_shock_score
-ggsave(
-  filename = "results/plots/umap_cold_shock_score.pdf", 
-  plot = umap_cold_shock_score, 
-  width = 10, 
-  height = 9
-)
+# ggsave(
+#   filename = "results/plots/umap_cold_shock_score.pdf", 
+#   plot = umap_cold_shock_score, 
+#   width = 10, 
+#   height = 9
+# )
 violin_cold_shock_score <- VlnPlot(
   cll_merged, 
   features = "cold_shock_score1", 
@@ -71,12 +97,18 @@ violin_cold_shock_score <- VlnPlot(
   cols = viridis(6)
 )
 violin_cold_shock_score
-ggsave(
-  filename = "results/plots/violin_cold_shock_score.pdf", 
-  plot = violin_cold_shock_score, 
-  width = 10, 
-  height = 7
-)
+# ggsave(
+#   filename = "results/plots/violin_cold_shock_score.pdf", 
+#   plot = violin_cold_shock_score, 
+#   width = 10, 
+#   height = 7
+# )
+```
+
+
+# Regress out signature
+
+```{r}
 lmp <- function (modelobject) {
   if (class(modelobject) != "lm") stop("Not an object of class 'lm' ")
   f <- summary(modelobject)$fstatistic
@@ -130,6 +162,12 @@ palette <- c("#999999", "#92e8df", "yellow2", "limegreen", "#632c63", "#e4624e")
 regressed <- DimPlot(cll_merged2, reduction = "umap", cols = palette)
 original <- DimPlot(cll_merged, reduction = "umap", cols = palette)
 ggarrange(plotlist = list(original, regressed), ncol = 2)
-saveRDS(list(original = original, regressed = regressed), file = "results/R_objects/ggplots/umaps_original_corrected.rds")
+# saveRDS(list(original = original, regressed = regressed), file = "results/R_objects/ggplots/umaps_original_corrected.rds")
+```
+
+# Session Information
+
+```{r}
+sessionInfo()
 ```
 
