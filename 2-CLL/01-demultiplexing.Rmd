@@ -1,7 +1,12 @@
 ---
-title: "Demultiplexing"
+title: "CLL: Demultiplexing"
 author: "Ramon Massoni-Badosa"
 date: "7/12/2019"
+output: 
+  BiocStyle::html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
 ---
 
 ```{r setup, include=FALSE}
@@ -16,7 +21,7 @@ In this project, we aim to understand the effect of time until cyropreservation 
 
 ### Description of the data
 
-To that end, we drew blood from 3 CLL patients (ids: 1220, 1472, 1892) and cyropreserved the samples after 0h (fresh), 2h, 4h, 6h, 8h and 24h at either room temperature (RT) or 4ºC (4C). To eliminate batch effect, detect doublets and reduce the library cost, we used the [cell hashing protocol](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-018-1603-1), in which each condition (in our case time-points) is labeled with an antibody against ubiquitous cell surface markers that is crosslinked with a sample-specific hashtag oligonucleotide (HTO), that is sequenced together with the cDNA libraries. 
+To that end, we drew blood from 3 CLL patients (ids: 1220, 1472, 1892) and cyropreserved the samples after 0h (fresh), 2h, 4h, 6h, 8h and 24h at either room temperature (RT) or 4ºC (4C). To eliminate batch effects, detect doublets and reduce the library cost, we performed [cell hashing ](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-018-1603-1). In this protocol, each condition (in our case time-points) is labeled with a specific hashtag oligonucleotide (HTO) that is crosslinked with an antibody. The antibodies bind to ubiquitous cell surface markers, and the HTO are sequenced alongside the single-cell gene expression libraries. We have the following samples:
 
 * 1220_RT (note that we do not have 4ºC for this donor)
 * 1472_4C
@@ -30,7 +35,7 @@ For each of them, we have 3 files: the expression matrix in sparse format, the l
 
 The objective of this notebook is to demultiplex the barcodes (cells) back to its original time-point. To achive that, we will follow [the pipeline from Seurat](https://satijalab.org/seurat/v3.0/hashing_vignette.html):
 
-#Pre-processing
+# Pre-processing
 
 ## Load packages
 
@@ -95,27 +100,39 @@ We can visualize the results as ridge plots or heatmaps:
 ```{r}
 ridge_l <- map(cll_list, function(cll) {
   Idents(cll) <- "HTO_maxID"
-  RidgePlot(cll, assay = "HTO", features = rownames(cll[["HTO"]])[1:6], ncol = 3)
+  RidgePlot(
+    cll,
+    assay = "HTO",
+    features = rownames(cll[["HTO"]])[1:6],
+    ncol = 2
+  )
 })
 
 heatmap_l <- map(cll_list, function(cll) {
   HTOHeatmap(cll, assay = "HTO", ncells = 5000)
 })
 
-# Save
-walk2(ridge_l, names(ridge_l), function(ridge, lib) {
-  ggsave(
-    filename = str_c("results/plots/", lib, "_hashtag_demux_ridge.pdf"),
-    plot = ridge, height = 9, 
-    width = 16
-  )
-})
-walk2(heatmap_l, names(heatmap_l), function(heat, lib) {
-  pdf(file = str_c("results/plots/", lib, "_hashtag_demux_heatmap.pdf"), height = 4, width = 7)
-  print(heat)
-  dev.off()
-})
+# # Save
+# walk2(ridge_l, names(ridge_l), function(ridge, lib) {
+#   ggsave(
+#     filename = str_c("results/plots/", lib, "_hashtag_demux_ridge.pdf"),
+#     plot = ridge, height = 9, 
+#     width = 16
+#   )
+# })
+# walk2(heatmap_l, names(heatmap_l), function(heat, lib) {
+#   ggsave(
+#     filename = str_c("results/plots/", lib, "_hashtag_demux_heatmap.png"), 
+#     plot = heat,
+#     height = 4, 
+#     width = 7
+#   )
+# })
+```
+```{r fig.wide=TRUE, fig.height=15}
 ridge_l
+```
+```{r fig.wide=TRUE}
 heatmap_l
 ```
 
@@ -171,7 +188,7 @@ cll_merged@meta.data <- cll_merged@meta.data[, selection]
 Finally, we can save it as .RDS for future analysis:
 
 ```{r}
-saveRDS(cll_merged, "results/R_objects/cll_Seurat_demultiplexed.rds")
+# saveRDS(cll_merged, "results/R_objects/cll_Seurat_demultiplexed.rds")
 ```
 
 # Session Info
