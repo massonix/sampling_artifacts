@@ -15,6 +15,8 @@ knitr::opts_chunk$set(echo = TRUE, out.width = "100%", fig.align='center',
 options(width = 1200)
 ```
 
+**Note**: The key parameter in this clustering analysis is the resolution in `FindClusters`. This was set after iterative trials of this pipeline combined with our domain knowledge of the clusters obtained.
+
 ```{r}
 # Key parameters
 num_significant_pcs <- 14
@@ -23,7 +25,8 @@ k_resolution <- 0.01
 
 # Introduction
 
-In the previous notebook, we filtered and normalized the expression matrix. In this notebook, we aim to identify the clusters of cells in the dataset and annotate them to the corresponding cell type. Furthermore, we will try to identify cycling cells.
+In the previous notebook, we filtered and normalized the expression matrix. Here, we aim to identify the clusters of cells in the dataset and annotate them to their corresponding cell type. Furthermore, we will try to identify cycling cells.
+
 
 # Pre-processing
 
@@ -53,14 +56,15 @@ cll_seu <- readRDS("results/R_objects/cll_seurat_filtered_normalized.rds")
 cll_seu$barcode <- colnames(cll_seu)
 ```
 
+
 # Find Variable Genes
 To cluster our cells, we need to overcome 2 challenges:
 
 1. The 'curse of dimensionality': as each cell can be conceived as a vector with >10,000 genes, and as two random cells will have the very similar expression for most genes, the distance measured between any given pair of cells will be very low, thus being unreliable for proper comparisons.
 2. Computational complexity: as the data is highly dimensional, even the most greedy algorithm will take long to complete. 
-3. Most genes should not be differentially expressed between cells, so the observed differences in such genes will be due to technical issues or transient biological states, that may confound the true structure in the dataset.
+3. Most genes should not be differentially expressed between cells, so the observed differences in such genes will be due to technical issues or transient biological states, hence confounding the true structure in the dataset.
 
-Thus, we aim to eliminate redundancy and denoise the dataset. To this end, we will find the subset of genes that drive most of the variability in the expression matrix (feature selection). Seurat calculates the average expression and dispersion for each gene. Then, it divides genes into bins based on its average, and for each bin computes a z-score per gene. Those genes with a z-score above a certain cutoff are categorized as highly variable. The binning step is vital, since genes with more UMI tend to have more dispersion.
+Thus, we aim to eliminate redundancy and denoise the dataset. To this end, we will find the subset of genes that drive most of the variability in the expression matrix (feature selection):
 
 ```{r}
 cll_seu <- FindVariableFeatures(cll_seu)
@@ -78,76 +82,42 @@ var_plot
 As we can see, we reduce the number of dimensions from >10,000 genes to `r num_var_genes` highly variable genes (HVG). Moreover, we see that among the top HVG there are well-known PBMC markers, such as LYZ, S100A8 (monocytes), GNLY and NKG7 (natural killer and CD8+ T cells).
 
 # Scale data
-An important pre-processing step in any cluster analysis is to scale the data, as otherwise variables with a higher mean will have a higher weight in the distance metric:
+An important pre-processing step in any cluster analysis is to scale the data, as otherwise variables with a higher mean will have a higher weight in the distance matrix:
 
 ```{r}
 cll_seu <- ScaleData(cll_seu)
 ```
 
 # Linear dimensionality reduction (PCA)
-An additional challenge in our cluster analysis is that scRNAs-seq is very noisy (very susceptible to technical artifacts), and very sparse (contains drop-outs). Thus, differences in single genes may not be accurate to identify cell types. To that end, we can perform Principal Component Analysis, as PC can be conceived as a 'metagene' that includes information across a correlated gene set. Furthermore, we will reduce the dimensionality even more:             
+An additional challenge in our cluster analysis is that scRNAs-seq is very noisy (very susceptible to technical artifacts), and very sparse (contains drop-outs). Thus, differences in single genes may not be accurate to identify cell types. To that end, we can perform PCA, as every PC can be conceived as a 'metagene' that includes information across a correlated gene set. Furthermore, we will reduce the dimensionality even more:             
 
-```{r}
+```{r fig.wide=TRUE, fig.height=14}
 cll_seu <- RunPCA(cll_seu, features = VariableFeatures(cll_seu))
 VizDimLoadings(cll_seu, dims = 1:3, reduction = "pca")
 DimPlot(cll_seu, reduction = "pca")
 ```
 
 # Determine statistically significant principal components
-To determine the number of significant PCs to use, we will take advantage of a scree plot. That is, we will plot the variance explained by each PC in an ordered manner. We identify the number of significant PCs as the one in which we can observe an "elbow" (i.e. the reduction in explained variance diminishes):
+To determine the number of significant PCs to use, we will use an elbow plot:
 
 ```{r}
 ElbowPlot(cll_seu)
 ```
 
-The elbow is in PC`r num_significant_pcs`, so that is what we are going to use to cluster cells using the `FindClusters` function.
+The elbow is in PC `r num_significant_pcs`.
 
 # Cluster cells
-- Describe Louvain algorithm, way to choose number of clusters, average silohuette width.
-Exploratory:
-To cluster cells we will used the Seurat's built-in functions `FindNeighbors` and `FindClusters`, which use the graph-based [Louvain](https://en.wikipedia.org/wiki/Louvain_modularity) algorithm. The critical parameter for these functions is the resolution, which will determine the final number of clusters. To decide it, we will compute the silhouette width for varying resolutions, and choose the one that maximizes it. Thus, we will end up with clusters that will be very similar within them and dissimilar between them:
+
+To cluster cells we will used the Seurat's built-in functions `FindNeighbors` and `FindClusters`, which use the graph-based [Louvain](https://en.wikipedia.org/wiki/Louvain_modularity) algorithm.
 
 ```{r}
-cll_seu <- FindNeighbors(cll_seu, dims = 1:num_significant_pcs)
-resolutions <- c(
-  0.00025, 0.0001, 0.0005, 
-  seq(0.01, 0.1, by = 0.01),
-  seq(0.1, 1, by = 0.1), seq(1, 10, by = 1)
-)
-avgs_sil_width_df <- data.frame(num_k = c(), sil_width = c(), resolution = c())
-num_k <- 1
-for (res in resolutions) {
-  cll_seu <-  FindClusters(cll_seu, resolution = res)
-  curr_num_k <- length(levels(cll_seu$seurat_clusters))
-  if (curr_num_k == num_k) {
-    next
-  } else {
-    sil_width <- calc_sil_width(
-      object = cll_seu, 
-      clusters = cll_seu$seurat_clusters, 
-      npcs = 5, 
-      ncell = 5000
-    )
-    curr_df <- data.frame(num_k = curr_num_k, sil_width = sil_width, resolution = res)
-    avgs_sil_width_df <- rbind(avgs_sil_width_df, curr_df)
-    num_k <- curr_num_k 
-  }
-}  
-ggplot(avgs_sil_width_df, aes(num_k, sil_width, label = num_k)) +
-  geom_text() +
-  labs(x = "Number of clusters (k)", y = "Average Silhouette Width") +
-  theme_classic()
-```
-
-As we can see, 5 clusters provides the maximal silhouette, so we will use the following resolution:
-
-```{r}
-filter(avgs_sil_width_df, num_k == num_k)
 cll_seu <- FindNeighbors(cll_seu, dims = 1:num_significant_pcs)
 cll_seu <- FindClusters(cll_seu, resolution = k_resolution)
 ```
 
+
 # Non-linear dimensionality reduction 
+
 We can visualize the former clusters with a t-Stochastic Neighbor Embedding (tSNE) and uniform manifold approximation and projection (UMAP), which allow to depict more structure in the data than PCA:
 
 ```{r}
@@ -164,9 +134,14 @@ As we can see, there are `r num_k` major clusters.
 # Find cluster markers
 Let us find the markers for each of the clusters. That is, the genes that are exclusively expressed in one cluster:
 
-```{r}
-markers <- FindAllMarkers(cll_seu, features = VariableFeatures(cll_seu))
-saveRDS(markers, "results/R_objects/markers_cll_clusters.rds")
+```{r fig.wide=TRUE}
+markers <- FindAllMarkers(
+  cll_seu,
+  features = VariableFeatures(cll_seu),
+  only.pos = TRUE
+)
+DT::datatable(markers)
+# saveRDS(markers, "results/R_objects/markers_cll_clusters.rds")
 marker_selection <- unlist(map(0:(num_k-1), ~markers[markers$cluster == ., "gene"][0:5]))
 marker_selection
 DoHeatmap(cll_seu, features = marker_selection) + NoLegend()
@@ -174,7 +149,7 @@ DoHeatmap(cll_seu, features = marker_selection) + NoLegend()
 
 As we know from the initial PBMC study, cluster 4 are monocytes (as they express LYZ + S100A8); whilst cluster 3 are T and NK cells (as they express NKG7, GNLY and IL7R). We can project these markers in UMAP space:
 
-```{r}
+```{r fig.wide=TRUE, fig.height=12}
 FeaturePlot(
   cll_seu, 
   features = c("LYZ", "S100A8", "NKG7", "GNLY", "IL7R", "MS4A1"), 
@@ -206,7 +181,7 @@ cll_seu <- CellCycleScoring(object = cll_seu, s.features = s_genes, g2m.features
 FeaturePlot(object = cll_seu, features = c("S.Score", "G2M.Score"))
 ```
 
-Although one would expect that leukemic cells are cycling, we have to keep in mind that this is a chronic disease were cells accumulate during decades. Thus, at a single time-point it is hard to detect differencesin cell proliferation
+Although one would expect that leukemic cells are cycling, we have to keep in mind that this is a chronic disease were cells accumulate during decades. Thus, at a single time-point it is hard to detect differencesin cell proliferation. Moreover, CLL usually proliferate in lymph nodes, not in the blood
 
 # Assigning cell type identity to clusters
 Based on the previous findings, we can annotate each cluster to known cell types:
@@ -330,7 +305,7 @@ Idents(cll_ori) <- "hash.ID"
 DimPlot(cll_ori, reduction = "umap")
 ```
 
-As we can see, DoubletFinder-predicted doublets hashing-predicted doublets, cluster together, which validates the rpedictions of DoubletFinder. Hence, we can clean our dataset even more and filter them out:
+As we can see, DoubletFinder-predicted and hashing-predicted doublets cluster together, which validates the prediction of DoubletFinder. Hence, we can clean our dataset even more and filter them out:
 
 ```{r}
 cll_seu <- subset(cll_seu, subset = doublet_annot == "Singlet")
@@ -339,10 +314,81 @@ cll_seu
 
 Idea: given that we have ground-truth about between-timepoint doublets, we could find, for each cell, the proportion of neareast doublets, correlate it with highly-expressing genes and discard the outliers.
 
+Now that, we performed the final filtering step in our QC, let us quantify the number of high-quality cells stratified by time, temperature and condition.
+
+```{r}
+qc_df2 <- cll_seu@meta.data
+qc_df2$temperature <- case_when(
+  qc_df2$temperature == "4C" ~ "4ºC",
+  qc_df2$temperature == "RT" & qc_df2$time == "0h" ~ "0h",
+  qc_df2$temperature == "RT" & qc_df2$time != "0h" ~ "21ºC"
+)
+qc_df2 <- qc_df2 %>%
+  mutate(time = factor(time, levels = c("0h", "2h", "4h", "6h", "8h", "24h")),
+         temperature = factor(temperature, levels = c("0h", "21ºC", "4ºC")),
+         donor = factor(donor, levels = c("1220", "1472", "1892"))) %>%
+  group_by(donor, temperature, time) %>% 
+  summarise(num_cells_after_qc = n())
+col_sel <- c("time", "temperature", "donor", "num_cells_after_qc")
+qc_df2 <- qc_df2[, col_sel]
+qc_df <- readRDS(file = "results/R_objects/qc_summary_table_cll.rds")
+qc_df <- add_column(
+  qc_df,
+  num_cells_after_qc = qc_df2$num_cells_after_qc,
+  .after = "num_cells_before_qc"
+)
+qc_df <- add_column(
+  qc_df,
+  experiment = rep("CLL", nrow(qc_df)),
+  .after = 0
+)
+
+# Merge it with PBMC
+qc_pbmc <- readRDS("../1-PBMC/results/R_objects/qc_summary_table_pbmc.rds")
+qc_pbmc <- add_column(
+  qc_pbmc,
+  experiment = rep("PBMC", nrow(qc_pbmc)),
+  .after = 0
+)
+qc_df_all <- rbind(qc_pbmc, qc_df)
+DT::datatable(qc_df_all)
+# saveRDS(qc_df_all, file = "results/R_objects/qc_summary_table_all.rds")
+```
+
+Let us do the same but for each cell type:
+
+```{r}
+qc_cell_type_cll <- cll_seu@meta.data
+qc_cell_type_cll$temperature <- case_when(
+  qc_cell_type_cll$temperature == "4C" ~ "4ºC",
+  qc_cell_type_cll$temperature == "RT" & qc_cell_type_cll$time == "0h" ~ "0h",
+  qc_cell_type_cll$temperature == "RT" & qc_cell_type_cll$time != "0h" ~ "21ºC"
+)
+qc_cell_type_cll <- qc_cell_type_cll %>%
+  mutate(temperature = factor(temperature, levels = c("0h", "21ºC", "4ºC")),
+         donor = factor(donor, levels = c("1220", "1472", "1892"))) %>%
+  group_by(time, donor, temperature, cell_type) %>%
+  summarise(num_cells = n()) %>%
+  ungroup()
+colnames(qc_cell_type_cll)[4] <- "annotation"
+qc_cell_type_cll <- add_column(
+  qc_cell_type_cll,
+  experiment = rep("CLL", nrow(qc_cell_type_cll)),
+  .after = 0
+)
+qc_cell_type_pbmc <- readRDS("../1-PBMC/results/R_objects/qc_summary_table_cell_type_pbmc.rds")
+qc_cell_type_df_all <- rbind(qc_cell_type_pbmc, qc_cell_type_cll)
+DT::datatable(qc_cell_type_df_all)
+
+# Save as excel file
+to_excel <- list(sampling_time = qc_df_all, cell_type = qc_cell_type_df_all)
+# openxlsx::write.xlsx(to_excel, file = "results/tables/quality_control_metrics.xlsx")
+```
+
 # Save Seurat object
 
 ```{r}
-saveRDS(cll_seu, file = "results/R_objects/cll_seurat_annotated.rds")
+# saveRDS(cll_seu, file = "results/R_objects/cll_seurat_annotated.rds")
 ```
 
 # Session Info
