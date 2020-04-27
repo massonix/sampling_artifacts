@@ -1,5 +1,5 @@
 ###############################################################################
-#######FIGURE 1: Sampling time is a major bias ################################
+############################# FIGURE 1 ########################################
 ###############################################################################
 
 # Load packages
@@ -19,7 +19,7 @@ tsne_male_pbmc <- tsne_male_pbmc$male
 umap_cll <- readRDS("current/2-CLL/results/R_objects/ggplots/umap_RT_CLL.rds")
 pc1_vs_time <- readRDS("current/1-PBMC/results/R_objects/ggplots/pc1_time_Seuratv3_gg.rds")
 dotplot <- readRDS("current/1-PBMC/results/R_objects/ggplots/dotplot_top_genes_signature.rds")
-ma_plot <- readRDS("current/1-PBMC/results/R_objects/ggplots/ma_plot_all_types_pbmc.rds")
+ma_plot <- readRDS("current/6-Reviews/results/R_objects/ma_plot_all_types_pbmc.rds")
 vln_cold_score <- readRDS("current/1-PBMC/results/R_objects/ggplots/violin_cold_shock_score.rds")
 roc <- readRDS("current/1-PBMC/results/R_objects/ggplots/roc_curve_pbmc.rds")
 
@@ -38,18 +38,19 @@ violin_atac <- atac_df %>%
   scale_x_discrete(labels = c("T-cell", "Monocyte", "CLL")) +
   scale_fill_manual("", values = c("dodgerblue3", "firebrick3")) +
   scale_color_manual("", values = c("dodgerblue3", "firebrick3")) +
-  labs(x = "", y = "Scaled p-value", fill = "", color = "") +
+  labs(x = "", y = "z-score", fill = "", color = "") +
   theme_classic() +
   theme(axis.text.x = element_text(size = 10, color = "black")) +
   guides(fill = guide_legend(reverse = TRUE))
+saveRDS(atac_df, "current/1-PBMC/results/R_objects/atac_df_enhancers.rds")
 
 # Create barplot TFBM enrichment analysis
 df <- read_excel("current/doc/tables/supplementary_table1.xlsx", col_names = TRUE, sheet = "Integrative ATAC RNA")
 df <- df %>% 
   filter(names %in% c("JUNB", "FOSL1", "Stat6", "IRF9")) %>% 
-  select("names", "DN peaks", "UP peaks") %>% 
+  dplyr::select("names", "DN peaks", "UP peaks") %>% 
   gather(key = "is_up", value = "log10_p", - "names") %>% 
-  mutate(is_up = ifelse(is_up == "UP peaks", "up", "down"),
+  dplyr::mutate(is_up = ifelse(is_up == "UP peaks", "up", "down"),
          is_up = factor(is_up, levels = c("up", "down")))
 df$names[df$names == "Stat6"] <- "STAT6"
 df$names <- factor(df$names, levels = c("JUNB", "FOSL1", "STAT6", "IRF9"))
@@ -94,6 +95,7 @@ dotplot <- dotplot +
         legend.spacing.x = unit(0.20, 'cm'))
 roc <- roc + 
   geom_line(size = 1) +
+  scale_color_manual("", values = c("limegreen", "darkgray"), labels = c("time score", "random"))
   theme(legend.position = "right")
 x_titl <- expression("-log"[10]*"(p-value)")
 plotlist <- list(tsne_male_pbmc = tsne_male_pbmc, umap_cll = umap_cll, violin_atac = violin_atac, ma_plot = ma_plot, dotplot = dotplot, barplot_atac = barplot_atac, roc = roc)
@@ -109,7 +111,8 @@ walk(names(plotlist), function(plt) {
   )
 })
 vln_cold_score <- vln_cold_score +
-  theme(axis.title.y = element_text(size = 10), 
+  ylab("Time Score") +
+  theme(axis.title.y = element_text(size = 12), 
         axis.text.x = element_text(size = 11, hjust = 0.5),
         axis.text.y = element_text(size = 9.5, color = "grey30"),
         plot.title = element_blank(),
@@ -141,10 +144,10 @@ null_violin <- plot_grid(NULL, violin_atac, nrow = 2, ncol = 1, rel_heights = c(
 row1 <- plot_grid(tsne_umap_boxplot, NULL, null_violin, nrow = 1, ncol = 3, rel_widths = c(0.67, 0.025, 0.33))
 
 ## Row 2
-ma_barplot <- ggarrange(plotlist = list(ma_plot, NULL, barplot_atac), nrow = 1, ncol = 3, widths = c(1, 0.01, 1), align = "h")
-violin_roc <- ggarrange(plotlist = list(vln_cold_score, NULL, roc), nrow = 1, ncol = 3, widths = c(1, 0.01, 1), align = "h")
-ma_barplot_violin_roc <- plot_grid(ma_barplot, violin_roc, nrow = 2, ncol = 1, rel_heights = c(1, 1))
-row2 <- plot_grid(dotplot, NULL, ma_barplot_violin_roc, nrow = 1, ncol = 3, rel_widths = c(0.33, 0.01, 0.67))
+ma_vln <- ggarrange(plotlist = list(ma_plot, vln_cold_score), nrow = 2, ncol = 1, align = "v")
+barplot_roc <- ggarrange(plotlist = list(barplot_atac, roc), nrow = 2, ncol = 1, align = "v")
+ma_vln_barplot_roc <- ggarrange(plotlist = list(ma_vln, barplot_roc), ncol = 2, align = "h")
+row2 <- plot_grid(dotplot, NULL, ma_vln_barplot_roc, nrow = 1, ncol = 3, rel_widths = c(0.33, 0.005, 0.67))
 
 ## Figure 1
 fig1 <- plot_grid(row1, NULL, row2, nrow = 3, ncol = 1, rel_heights = c(1.1, 0.065, 1))
@@ -152,5 +155,25 @@ fig1 <- plot_grid(row1, NULL, row2, nrow = 3, ncol = 1, rel_heights = c(1.1, 0.0
 # Save
 ggsave(plot = fig1, filename = "current/doc/figures/R/figure1.pdf", height = 23, width = 18, units = "cm")
 
+###############################################################################
 
+atac_df <- as.data.frame(atac_df)
+
+# T-cell
+atac_t_df <- atac_df[atac_df$cell_type == "T cell", ]
+wilcox.test(scaled_p_value ~ is_up, data = atac_t_df, alternative = "two.sided")
+
+# Monocyte
+atac_mono_df <- atac_df[atac_df$cell_type == "Monocyte", ]
+wilcox.test(scaled_p_value ~ is_up, data = atac_mono_df, alternative = "two.sided")
+p_val <- c(0.008765, 0.03602)
+
+# CLL
+atac_cll_df <- atac_df[atac_df$cell_type == "CLL", ]
+wilcox.test(scaled_p_value ~ is_up, data = atac_cll_df, alternative = "two.sided")
+
+
+p_val <- c(2.827e-06, 8.821e-08, 0.005228)
+names(p_val) <- c("T-cell", "Monocyte", "CLL")
+p_val
 
