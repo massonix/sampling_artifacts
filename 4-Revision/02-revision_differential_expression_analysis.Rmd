@@ -1,0 +1,474 @@
+---
+title: "Revision: Differential Expression Analysis"
+author: "Ramon Massoni-Badosa"
+date: "3/3/2020"
+output: 
+  BiocStyle::html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, out.width = "100%", fig.align='center', 
+                      message=FALSE, warning = FALSE)
+options(width = 1200)
+```
+
+# Introduction
+
+The objective of this notebook is to directly compare the sampling time-associated transcriptomic signature with the ones reported in the following papers (as requested by reviewer #2):
+
+
+1. [Baechler EC](https://www.nature.com/articles/6364098), Batliwalla FM, Karypis G, Gaffney PM, Moser K, Ortmann WA, *et al*. Expression levels for many genes in human peripheral blood cells are highly sensitive to ex vivo incubation. Genes Immun. 2004;5:347–53.
+2. [Brink SC van den](https://www.nature.com/articles/nmeth.4437), Sage F, Vértesy Á, Spanjaard B, Peterson-Maduro J, Baron CS, *et al*. Single-cell sequencing reveals dissociation-induced gene expression in tissue subpopulations.Nat Methods. 2017;14:935–6.
+
+**Note**: Initially, we also aimed to compare it with the study by [Dvinge *et al.*](https://www.pnas.org/content/111/47/16802), which studied the effect of sampling time on leukimic bulk RNA-seq profiles. However, we could only find the log fold-changes, whose ranking did not reflect the signature they report. Thus, we excluded it from our comparison.
+
+Finally, reviewer #2 pointed out that the number of differentially expressed genes (DEG) reported and the magnitude of the log fold-changes was very small. We discuss this in more detail below in light of the new analysis.
+
+
+# Pre-processing
+
+## Load packages
+
+```{r}
+library(scater)
+library(Seurat)
+library(ggpubr)
+library(purrr)
+library(kBET)
+library(readxl)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(annaffy)
+library(moe430b.db)
+library(biomaRt)
+library(pheatmap)
+library(viridis)
+library(cowplot)
+library(ggrepel)
+library(VennDiagram)
+library(tidyverse)
+```
+
+## Source script
+
+```{r}
+source("bin/utils.R")
+```
+
+## Load data
+
+```{r}
+# PBMC
+pbmc <- readRDS("../1-PBMC/results/R_objects/10X_pbmc_Seurat_clustered.RDS")
+pbmc <- subset(pbmc, subset = condition %in% c("0h", "2h", "8h", "24h_RT", "48h_RT"))
+pbmc$time <- factor(pbmc$condition, levels = c("0h", "2h", "8h", "24h_RT", "48h_RT"))
+levels(pbmc$time) <-  c("0h", "2h", "8h", "24h", "48h")
+Idents(pbmc) <- "cell_type"
+
+# CLL
+cll <- readRDS("../2-CLL/results/R_objects/cll_seurat_annotated.rds")
+cll <- subset(cll, temperature == "RT")
+
+# Get signatures
+pbmc_signature_all <- readRDS("../1-PBMC/results/R_objects/cold_shock_signature.rds")
+pbmc_signature_up <- readRDS("../1-PBMC/results/R_objects/cold_shock_signature_up.rds")
+cll_signature_all <- readRDS("../2-CLL/results/R_objects/cold_shock_signature_all.rds")
+cll_signature_up <- readRDS("../2-CLL/results/R_objects/cold_shock_signature_up.rds")
+```
+
+# Define signatures other datasets
+
+## Load and pre-process data from other studies
+
+```{r}
+# Baechler
+excel_sheets("data/41435_2004_BF6364098_MOESM1_ESM.xls")
+baechler <- read_excel(
+  "data/41435_2004_BF6364098_MOESM1_ESM.xls",
+  sheet = "Supp. table 2",
+  skip = 1
+)
+baechler <- dplyr::select(baechler, "Probe Set", "Acc. Number", "Gene", "Fold change", "p-value")
+colnames(baechler) <- c("probe_set", "acc_number", "gene", "fold_change", "p_value")
+
+# van den Brink
+van_den_brink <- read_excel(
+  "data/41592_2017_BFnmeth4437_MOESM3_ESM.xlsx",
+  sheet = "Fig1a"
+)
+```
+
+## Calculate signatures
+
+```{r}
+####BAECHLER####
+baechler <- baechler %>%
+  filter(p_value < 0.001) %>%
+  arrange(desc(abs(fold_change)))
+baechler_signature <- baechler$acc_number[1:250]
+baechler_signature <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keytype = "ACCNUM",
+  columns = "SYMBOL",
+  keys = baechler_signature
+)
+baechler_signature <- baechler_signature[match(unique(baechler_signature$ACCNUM), baechler_signature$ACCNUM), ]
+
+# Curate the NA manually
+na_accnum <- baechler_signature$ACCNUM[is.na(baechler_signature$SYMBOL)]
+baechler <- as.data.frame(baechler)
+# rownames(baechler) <- baechler$acc_number
+na_gene_descr <- baechler[baechler$acc_number %in% na_accnum, "gene"]
+
+# Search missing accession numbers in uniprot 1 by 1 (44 in total)
+# Verify with gene info of the baechler metadata
+symbols_replace <- c("ADORA2A", "CCR2", "JUN", "HSPA1A", "CALR", "CD28",
+                     "TRAV8-6", "HSPA1B", "MICA", "ZSCAN9", "LRRN3", NA,
+                     "LIN37", "ZEB1", "MINA", NA, NA, "TNFRSF17", "FAM50B",
+                     NA, "ACSL4", "FUS", NA, "BCL11A", "GPLD1", NA, "H1-4",
+                     "IFNAR2", NA, NA, "RANBP9", "NUP98", "SEC23IP", "RRAS2",
+                     NA, NA, "BRCA1", "CD59", "CCR6", "LRIG1", "TRAC", NA, "METTL3", NA)
+baechler_signature$SYMBOL[is.na(baechler_signature$SYMBOL)] <- symbols_replace
+baechler_signature <- baechler_signature$SYMBOL[!is.na(baechler_signature$SYMBOL)]
+# saveRDS(baechler_signature, "results/R_objects/baechler_signature.rds")
+
+####van den Brink####
+van_den_brink_signature <- van_den_brink$GeneName[van_den_brink$padj < 0.001]
+van_den_brink_signature <- str_remove(van_den_brink_signature, "__chr.*$")
+van_den_brink_signature <- convertMouseGeneList(van_den_brink_signature)
+# saveRDS(van_den_brink_signature, "results/R_objects/van_den_brink_signature.rds")
+```
+
+## Find direction (up- or down-regulated)
+
+```{r}
+# Ours
+our_signatures <- list(pbmc = pbmc_signature_all, cll = cll_signature_all)
+our_signatures_up <- list(pbmc = pbmc_signature_up, cll = cll_signature_up)
+our_signs_df <- purrr::map2(our_signatures, our_signatures_up, function(sign, sign_up) {
+  direct <- ifelse(sign %in% sign_up, "up-regulated", "down-regulated")
+  df <- data.frame(gene = sign, direction = direct)
+  df
+})
+
+# van den Brink (all up)
+van_den_brink_df <- data.frame(
+  gene = van_den_brink_signature,
+  direction = rep("up-regulated", length(van_den_brink_signature))
+)
+
+# Baechler
+baechler_accnum <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keytype = "SYMBOL",
+  columns = "ACCNUM",
+  keys = baechler_signature
+)
+baechler_accnum <- baechler_accnum[baechler_accnum$ACCNUM %in% baechler$acc_number, ]
+baechler_selected <- baechler[baechler$acc_number %in% baechler_accnum$ACCNUM, c("acc_number", "fold_change")]
+baechler_accnum$fold_change <- purrr::map_dbl(baechler_accnum$ACCNUM, function(x) {
+  fc <- baechler_selected[baechler_selected$acc_number == x, "fold_change"][1]
+  fc
+})
+baechler_accnum <- baechler_accnum[match(unique(baechler_accnum$SYMBOL), baechler_accnum$SYMBOL), ]
+baechler_direct <- purrr::map_chr(baechler_signature, function(x) {
+  if (x %in% baechler_accnum$SYMBOL) {
+    direct <- ifelse(
+      baechler_accnum$fold_change[baechler_accnum$SYMBOL == x] > 0,
+      "up-regulated",
+      "down-regulated"
+    )
+    direct
+  } else {
+    NA
+  }
+})
+names(baechler_direct) <- baechler_signature
+curate_manually <- names(baechler_direct)[is.na(baechler_direct)]
+curate_manually_direct <- c("down-regulated", "up-regulated", "down-regulated",
+                            "down-regulated", "down-regulated", "down-regulated",
+                            "down-regulated", "up-regulated", "down-regulated",
+                            "down-regulated", "NA", "NA", "NA", "down-regulated",
+                            "NA", "NA", "NA", "down-regulated", "downregulated",
+                            "up-regulated", "down-regulated", "down-regulated",
+                            "down-regulated", "NA", "down-regulated", "down-regulated",
+                            "down-regulated", "NA", "down-regulated", "NA")
+names(baechler_direct) <- NULL
+baechler_direct[is.na(baechler_direct)] <- curate_manually_direct
+baechler_signature_df <- data.frame(
+  gene = baechler_signature,
+  direction = baechler_direct
+)
+
+# Save
+signatures_dfs <- list(
+  PBMC = our_signs_df$pbmc,
+  CLL = our_signs_df$cll,
+  "van den Brink" = van_den_brink_df,
+  Baechler = baechler_signature_df
+)
+DT::datatable(signatures_dfs$PBMC)
+DT::datatable(signatures_dfs$CLL)
+DT::datatable(signatures_dfs$`van den Brink`)
+DT::datatable(signatures_dfs$Baechler)
+# openxlsx::write.xlsx(signatures_dfs, "results/tables/gene_expression_signatures_comparison.xlsx")
+```
+
+## Venn Diagram
+
+```{r}
+signatures <- purrr::map(signatures_dfs, "gene")
+venn <- venn.diagram(
+  signatures,
+  fill = 2:5,
+  alpha = 0.35,
+  filename = NULL,
+  cat.just = list(c(0.6,1), c(0,0), c(0,0), c(1,1))
+)
+grid.draw(venn)
+```
+
+## Heatmap
+
+Select genes that intersect in at least two datasets:
+
+```{r}
+# Find genes to plot (at least in two signatures, unifying ours (PBMC + CLL) 
+ours_union <- Reduce(union, list(signatures$PBMC, signatures$CLL))
+signatures_heat <- list(
+  ours_union,
+  signatures$Baechler,
+  signatures$`van den Brink`
+)
+all_genes <- Reduce(union, signatures_heat)
+n_genes_in_sign_l <- purrr::map_int(all_genes, function(gene) {
+  sum(purrr::map_int(signatures_heat, ~gene %in% .x))
+})
+selected_genes <- all_genes[n_genes_in_sign_l >= 2]
+```
+
+Plot heatmap
+
+```{r}
+heatmap_row_list <- purrr::map(selected_genes, function(gene) {
+  heat_row <- purrr::map_dbl(signatures_dfs, function(df) {
+    if (!(gene %in% df$gene)) {
+      0
+    } else if (df[df$gene == gene, "direction"] == "up-regulated") {
+      1
+    } else {
+      -1
+    }
+  })
+  heat_row
+})
+heat_mat <- Reduce(rbind, heatmap_row_list)
+rownames(heat_mat) <- selected_genes
+cols <- c("royalblue3", "white", "red3")
+heat_mat <- heat_mat[order(rowSums(heat_mat), decreasing = TRUE), ]
+heatmap_signatures <- pheatmap(
+  heat_mat,
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  color = cols,
+  legend = FALSE,
+  angle_col = 45,
+  fontsize_col = 13
+)
+print(heatmap_signatures)
+```
+
+# Compute cell-specific scores for each signature
+
+```{r}
+names(signatures)[3] <- "van_den_Brink"
+purrr::walk2(signatures, names(signatures), function(sign, x) {
+  pbmc <<- AddModuleScore(pbmc, features = list(sign), name = x)
+})
+
+# Plot tsnes
+titles <- c("PBMC", "CLL", "van den Brink", "Baechler")
+tsnes_signatures <- purrr::map2(names(signatures), titles, function(x, y) {
+  tsne <- FeaturePlot(
+    pbmc,
+    features = str_c(x, "1", sep = ""),
+    pt.size = 0.35,
+    reduction = "tsne",
+    cols = viridis(10))
+  tsne + 
+    ggtitle(y) +
+    theme(plot.title = element_text(size = 13, face = "plain"),
+          axis.title = element_blank(),
+          axis.text = element_blank(),
+          axis.ticks = element_blank(),
+          axis.line = element_blank())
+})
+leg <- as_ggplot(get_legend(tsnes_signatures[[1]]))
+# ggsave(filename = "../doc/figures/legends/tsne_signatures_comparison.pdf", height = 4, width = 4)
+tsnes_signatures <- ggarrange(
+  plotlist = tsnes_signatures,
+  nrow = 2,
+  ncol = 2,
+  legend = "none"
+)
+tsnes_signatures
+```
+
+As we can observe, there is a large overlapping in the upregulation of key stress-related genes, namely NFKBIA, JUN, JUND or FOSB. However, there is a poor global intersection, which indicates the following:
+
+- Different stressors lead to different transcriptomic signatures (treatment with collagenase VS sampling time).
+- Different technologies have different sensitivity/specificity to measure transcriptomic changes associated with a condition (Baechler vs ours). 
+
+## Arrange figure
+
+```{r}
+# colnames(heat_mat) <- NULL
+# heatmap_signatures <- pheatmap(
+#   heat_mat,
+#   cluster_rows = FALSE,
+#   cluster_cols = FALSE,
+#   color = cols,
+#   angle_col = 45,
+#   legend = FALSE
+# )
+names(signatures) <- c("", "", "", "")
+venn_no_labels <- venn.diagram(
+  signatures,
+  fill = 2:5,
+  alpha = 0.35,
+  filename = NULL
+)
+# fig <- plot_grid(as_ggplot(venn_no_labels), heatmap_signatures[[4]],
+#                  tsnes_signatures, nrow = 2)
+# fig
+fig_row1 <- plot_grid(as_ggplot(venn_no_labels), NULL, heatmap_signatures[[4]],
+                      ncol = 3, rel_widths = c(0.65, 0.025, 0.45))
+fig_row2 <- tsnes_signatures
+fig <- plot_grid(fig_row1, fig_row2, nrow = 2, rel_heights = c(0.45, 0.55))
+# ggsave(plot = fig, filename = "../doc/figures/R/suppZ.pdf", width = 18, height = 23, units = "cm")
+```
+
+
+# P-values and log (fold-changes)
+
+In the manuscript, we argue that sampling time induces a downregulation of gene expression, which leads to a time-dependent reduction in the number of detected genes. Reviewer #2 questioned this claim by arguing that >200 DEG cannot be considered a global effect. Although this is a valid point, we especulate that this is because of the default logFC parameter of the `FindMarkers()` function, which only tests for differential expression if a gene has a minimal logFC of 0.25. As a global effect entails subtle changes to the majority of genes, we will set this parameter to 0 and recompute the DEG. Finally, we will also recompute the log fold-changes, as we previously used a pseudocount too large for the sparse nature of scRNA-seq data:
+
+```{r}
+# New DEA setting logfc.threshold to 0 to detecte more subtle effects
+pbmc_types <- SplitObject(pbmc, split.by = "cell_type")
+seurat_list <- list(pbmc = pbmc, cll = cll)
+seurat_list <- c(seurat_list, pbmc_types)
+seurat_list <- seurat_list[c("pbmc", "cll", "T", "NK", "Monocyte", "B")]
+names(seurat_list) <- c("PBMC", "CLL", "T-cell", "NK", "Monocyte", "B-cell")
+seurat_list <- purrr::map(seurat_list, function(seurat) {
+  seurat$is_biased <- ifelse(seurat$time %in% c("0h", "2h"), "unbiased", "biased")
+  Idents(seurat) <- "is_biased"
+  seurat
+})
+dea_list <- purrr::map(seurat_list, function(seurat) {
+  dea_df <- FindMarkers(
+    seurat,
+    ident.1 = "biased",
+    ident.2 = "unbiased",
+    test.use = "wilcox",
+    logfc.threshold = 0
+  )
+  dea_df
+})
+dea_df_l <- purrr::map2(dea_list, seurat_list, function(df, seurat) {
+  mat <- as.matrix(seurat[["RNA"]]@data[rownames(df), ])
+  average_expression <- rowMeans(mat)
+  log2_fc <- apply(mat, 1, function(x) {
+    mean_biased <- mean(x[seurat$is_biased == "biased"]) + 0.05
+    mean_unbiased <- mean(x[seurat$is_biased == "unbiased"]) + 0.05
+    log2(mean_biased / mean_unbiased)
+  })
+  df <- df %>%
+    rownames_to_column(var = "gene") %>% 
+    dplyr::select("gene", "p_val", "p_val_adj") %>% 
+    dplyr::mutate(average_expression = average_expression, log2_fc = log2_fc) %>% 
+    dplyr::arrange(p_val_adj) %>%
+    dplyr::filter(p_val_adj < 0.001)
+  df <- df[, c("gene", "average_expression", "log2_fc", "p_val", "p_val_adj")]
+  df
+})
+DT::datatable(dea_df_l$PBMC)
+DT::datatable(dea_df_l$CLL)
+DT::datatable(dea_df_l$`T-cell`)
+DT::datatable(dea_df_l$NK)
+DT::datatable(dea_df_l$Monocyte)
+DT::datatable(dea_df_l$`B-cell`)
+# openxlsx::write.xlsx(dea_df_l, file = "results/tables/dea_storage_time.xlsx")
+```
+
+## MA plot
+
+```{r}
+sheets <- c("PBMC", "CLL")
+xl_path <- "results/tables/dea_storage_time.xlsx"
+dea_df_l <- purrr::map(sheets, ~read_excel(xl_path, sheet = .x, skip = 2, col_names = TRUE))
+# subset_sig_cll <- readRDS("../2-CLL/results/R_objects/subset_significant_cll.rds")
+names(dea_df_l) <- sheets
+ma_plot_dfs <- purrr::map2(list(pbmc, cll), dea_df_l, function(seurat, dea_df) {
+  seurat$is_biased <- ifelse(seurat$time %in% c("0h", "2h"), "unbiased", "biased")
+  mat <- as.matrix(seurat[["RNA"]]@data)
+  average_expression <- rowMeans(mat)
+  log2_fc <- apply(mat, 1, function(x) {
+    mean_biased <- mean(x[seurat$is_biased == "biased"]) + 0.05
+    mean_unbiased <- mean(x[seurat$is_biased == "unbiased"]) + 0.05
+    log2(mean_biased / mean_unbiased)
+  })
+  is_significant <- map_lgl(rownames(mat), function(x) {
+    if (x %in% dea_df$gene) {
+      if (dea_df[dea_df$gene == x, "p_val_adj"] < 0.001) {
+        TRUE
+      } else {
+        FALSE
+      }
+    } else {
+      FALSE
+    }
+  })
+  df <- data.frame(
+    average_expression = average_expression,
+    log2_fc = log2_fc,
+    is_significant
+  )
+  df
+})
+names(ma_plot_dfs) <- sheets
+ma_plot_gg <- purrr::map(ma_plot_dfs, function(df) {
+  ma_plot <- df %>%
+    ggplot(aes(log(average_expression + 1), log2_fc, color = is_significant)) +
+      geom_point(size = 0.2, alpha = 0.6) +
+      geom_smooth(method = "loess", color = "darkblue") +
+      geom_hline(yintercept = 0, color = "black", linetype = "dashed") +
+      scale_color_manual(values = c("gray78", "green4"), labels = c("sig", "no sig")) +
+      labs(x = "log (Average Expression)", y = "log (biased / unbiased)", color = "") +
+      theme_classic2() +
+      theme(axis.title = element_text(size = 11),
+            legend.text = element_text(size = 11),
+            plot.title = element_text(hjust = 0.5, face = "bold"))
+  ma_plot
+})
+# saveRDS(ma_plot_gg$PBMC, "results/R_objects/ma_plot_all_types_pbmc.rds")
+subset_sig <- dea_df_l$CLL %>%
+  dplyr::filter(p_val_adj < 10e-10 & abs(log2_fc) > 0.35 & average_expression > 0.75)
+ma_plot_gg$CLL <- ma_plot_gg$CLL +
+  geom_text_repel(data = subset_sig, aes(label = gene), color = "black", size = 2.5)
+ma_plot_gg$PBMC
+ma_plot_gg$CLL
+# saveRDS(ma_plot_gg$CLL, "results/R_objects/ma_plot_all_cell_types_cll.rds")
+```
+
+Interestingly, we see how now we report >1,000 DEG. Moreover, the vast majority of these DEG are down-regulated, which is in line with our main findings.
+
+# Session Information
+
+```{r}
+sessionInfo()
+```
+
