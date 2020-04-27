@@ -1,0 +1,116 @@
+---
+title: "Revision: Storage at 4ºC"
+author: "Ramon Massoni-Badosa"
+date: "3/12/2020"
+output: 
+  BiocStyle::html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, out.width = "100%", fig.align='center', 
+                      message=FALSE, warning = FALSE)
+options(width = 1200)
+```
+
+# Introduction
+
+Reviewer #2 proposed to analyse the effect of time at 4ºC prior to cryopreservation on scRNA-seq profiles in more detail. Here, we aim to compare the time-dependent increase in the number of differentially expressed genes (DEG) between both temperatures (room temperature and 4ºC).
+
+# Pre-processing
+
+## Package loading
+
+```{r}
+library(scater)
+library(Seurat)
+library(ggpubr)
+library(purrr)
+library(kBET)
+library(viridis)
+library(tidyverse)
+```            
+
+## Load data
+
+```{r}
+# PBMC
+pbmc <- readRDS("../1-PBMC/results/R_objects/10X_pbmc_Seurat_clustered.RDS")
+pbmc$temperature <- case_when(
+  pbmc$condition == "0h" ~ "0h",
+  pbmc$condition %in% c("2h", "8h", "24h_RT", "48h_RT") ~ "RT",
+  pbmc$condition %in% c("24h_4C", "48h_4C") ~ "4C"
+)
+pbmc$time <- pbmc$condition %>% 
+  str_remove("_RT") %>% 
+  str_remove("_4C")
+pbmc$time <- factor(pbmc$time, levels = c("0h", "2h", "8h", "24h", "48h"))
+
+# CLL
+cll <- readRDS("../2-CLL/results/R_objects/cll_seurat_annotated.rds")
+cll$temperature <- case_when(
+  cll$time == "0h" ~ "0h",
+  cll$time != "0h" & cll$temperature == "RT" ~ "RT",
+  cll$time != "0h" & cll$temperature == "4C"  ~ "4C"
+)
+```
+
+# Number of DEG across temperatures
+
+```{r}
+# CLL
+set.seed(1)
+Idents(cll) <- "temperature"
+size <- 1000
+n_deg_dfs <- purrr::map(c("RT", "4C"), function(temp) {
+  seurat <- subset(cll, idents = c("0h", temp))
+  Idents(seurat) <- "time"
+  n_deg_l <- purrr::map(c("2h", "4h", "6h", "8h", "24h"), function(t) {
+    selected_cells_t <- sample(colnames(seurat)[seurat$time == t], size)
+    selected_cells_0 <- sample(colnames(seurat)[seurat$time == "0h"], size)
+    seurat_sub <- SubsetData(seurat, cells = c(selected_cells_0, selected_cells_t))
+    dea <- FindMarkers(seurat_sub, ident.1 = t, ident.2 = "0h", test.use = "wilcox", logfc.threshold = 0)
+    n_deg_up <- nrow(dea[dea$p_val < 0.001 & dea$avg_logFC > 0, ])
+    n_deg_down <- nrow(dea[dea$p_val < 0.001 & dea$avg_logFC < 0, ])
+    df <- data.frame(n_deg = c(n_deg_up, -1 * n_deg_down), direction = c("up", "down"))
+    df
+  })
+  names(n_deg_l) <- c("2h", "4h", "6h", "8h", "24h")
+  n_deg_t_df <- bind_rows(n_deg_l, .id = "time")
+  n_deg_t_df
+})
+names(n_deg_dfs) <- c("21ºC", "4ºC")
+n_deg_t_temp_df <- bind_rows(n_deg_dfs, .id = "temperature")
+n_deg_t_temp_df$time <- n_deg_t_temp_df$time %>% 
+  str_remove("h") %>% 
+  as.numeric()
+n_deg_t_temp_df$temperature <- factor(n_deg_t_temp_df$temperature, levels = c("4ºC", "21ºC"))
+n_deg_0 <- data.frame(
+  temperature = c("21ºC", "21ºC", "4ºC", "4ºC"),
+  time = rep(0, 4),
+  n_deg = rep(0, 4),
+  direction = c("up", "down", "up", "down")
+)
+n_deg_t_temp_df <- rbind(n_deg_t_temp_df, n_deg_0)
+n_deg_t_temp_df$direction <- factor(n_deg_t_temp_df$direction, levels = c("up", "down"))
+n_deg_t_temp_gg <- ggplot(n_deg_t_temp_df, aes(time, n_deg, shape = direction, color = temperature)) +
+  geom_point() +
+  geom_line(aes(linetype = temperature)) +
+  labs(x = "Time (h)", y = "# Differentially Expressed Genes") +
+  scale_x_continuous(breaks = c(0, 2, 4, 6, 8, 24), labels = c(0, 2, 4, 6, 8, 24)) +
+  scale_y_continuous(limits = c(-1500, 1500), breaks = c(-1500, -1000, -500, 0, 500, 1000, 1500)) +
+  scale_color_manual(values = c("#a5cded", "darkorange1")) +
+  theme_classic()
+n_deg_t_temp_gg
+# saveRDS(n_deg_t_temp_gg, "results/R_objects/number_deg_4C_vs_21_CLL.rds")
+```
+
+# Session Information
+
+```{r}
+sessionInfo()
+```
+
+
