@@ -71,11 +71,11 @@ t_act_l <- purrr::map(t_act_l, function(seurat) {
 t_act_umaps <- purrr::map(t_act_l, function(seurat) {
   DimPlot(seurat, reduction = "umap", cols = c("#999999", "#58315E", "#D36A55"))
 })
-saveRDS(t_act_umaps, "results/R_objects/ggplots/umaps_t_activation.rds")
+# saveRDS(t_act_umaps, "results/R_objects/ggplots/umaps_t_activation.rds")
 t_act_tsnes <- purrr::map(t_act_l, function(seurat) {
   DimPlot(seurat, reduction = "tsne", cols = c("#999999", "#58315E", "#D36A55"))
 })
-saveRDS(t_act_tsnes, "results/R_objects/ggplots/tsnes_t_activation.rds")
+# saveRDS(t_act_tsnes, "results/R_objects/ggplots/tsnes_t_activation.rds")
 male_arranged <- ggarrange(
   plotlist = t_act_umaps[c("0M", "2M")], 
   nrow = 1, 
@@ -102,6 +102,8 @@ All in all, we exclude the female dataset; whilst the male dataset points to pro
 The former analysis provides qualitative information about the intermixing between time-points. To get a quantitative view, we will use [kBET](https://www.nature.com/articles/s41592-018-0254-1):
 
 ```{r}
+t_act_male <- t_act_l[c("0M", "2M")]
+# saveRDS(t_act_male, "results/R_objects/t_act_Seurat_male1.rds")
 acceptance_rates_l <- purrr::map(t_act_l, function(seurat) {
   seurat$is_biased <- ifelse(seurat$time == "0h", FALSE, TRUE)
   seurat <- pre_process_seurat(seurat)
@@ -133,8 +135,8 @@ acc_rate_m_gg <- acceptance_rates_m %>%
     facet_grid(. ~ day, scales = "free_x") +
     theme_classic()
 acc_rate_m_gg
-saveRDS(acc_rate_m_gg, "results/R_objects/ggplots/barplot_kBET_t_act.rds")
-saveRDS(t_act_l$`2M`, "results/R_objects/t_act_seurat_2M.rds")
+# saveRDS(acc_rate_m_gg, "results/R_objects/ggplots/barplot_kBET_t_act.rds")
+# saveRDS(t_act_l$`2M`, "results/R_objects/t_act_seurat_2M.rds")
 
 # day <- c("Original", "Cultured")
 # acceptance_rates_m <- data.frame(
@@ -198,7 +200,7 @@ cold_shock_violin <- cold_shock_df %>%
     scale_fill_manual(values = c("#3374A1", "#E1812C")) +
     theme_classic()
 cold_shock_violin
-saveRDS(cold_shock_violin, "results/R_objects/ggplots/boxplot_cold_shock_t_act.rds")
+# saveRDS(cold_shock_violin, "results/R_objects/ggplots/boxplot_cold_shock_t_act.rds")
 
 
 
