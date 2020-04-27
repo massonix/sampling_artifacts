@@ -412,7 +412,7 @@ tprs_l <- map2(t_act_l, nExp_poi, function(seurat, nExp) {
   })
   tprs
 })
-saveRDS(tprs_l, "results/R_objects/true_positive_rates_doublets.rds")
+# saveRDS(tprs_l, "results/R_objects/true_positive_rates_doublets.rds")
 tprs_l
 ```
 
@@ -556,7 +556,7 @@ t_act_seu <- purrr::map(t_act_sce, function(sce) {
   seurat
 })
 names(t_act_seu) <- c("day_0_rep1", "day_2_rep1", "day_0_rep2", "day_1_rep2")
-saveRDS(t_act_seu, "results/R_objects/t_act_Seurat_list_filtered_normalized.rds")
+# saveRDS(t_act_seu, "results/R_objects/t_act_Seurat_list_filtered_normalized.rds")
 ```
 
 # Session Info
