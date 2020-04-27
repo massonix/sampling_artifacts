@@ -16,7 +16,7 @@ options(width = 1200)
 ```
 
 # Introduction
-The objective of this notebook is to reproduce the findings observed for the male donor in the previous notebook (04-cell_culture_activation_effect.Rmd). We found that the female donor in the previous analysis was invalid, so we had only one reliable donor. To finally conclude that the cold-shock transcriptomic signature is removed after culturing and activating PBMC with anti-CD3 antibodies, herein we will analyze data from two more donors (female2, female3). For reproducibility and consistency purposes, the analysis will be almost the same as in the previous notebook, so we refer to that one for a full explanation on each step. 
+The objective of this notebook is to reproduce the findings observed for the male donor in the previous notebook (04-cell_culture_activation_effect.Rmd). We found that the female donor in the previous analysis was invalid, so we had only one reliable donor. To finally conclude that the cold-shock transcriptomic signature is removed after culturing and activating PBMC with anti-CD3 antibodies, herein we will analyze data from two more donors (female2, female3). For reproducibility and consistency purposes, the analysis will be almost the same as in the previous notebook, so we refer to that one for a full explanation of each step. 
 
 # Pre-processing
 
@@ -50,7 +50,7 @@ dea_list <- readRDS("../2-CLL/results/R_objects/dea_results_per_patient.rds")
 
 # Effect Cell Culture
 
-```{r}
+```{r fig.wide=TRUE}
 t_act_l <- purrr::map(t_act_l, RunTSNE, reduction = "pca", dims = 1:15)
 t_act_l <- purrr::map(t_act_l, function(seurat) {
   seurat$time <- factor(seurat$time, levels = c("0h", "8h", "24h"))
@@ -60,17 +60,24 @@ t_act_l <- purrr::map(t_act_l, function(seurat) {
 t_act_umaps <- purrr::map(t_act_l, function(seurat) {
   DimPlot(seurat, reduction = "umap", cols = c("#999999", "#58315E", "#D36A55"))
 })
-saveRDS(t_act_umaps, "results/R_objects/ggplots/umaps_t_activation_rep2.rds")
+# saveRDS(t_act_umaps, "results/R_objects/ggplots/umaps_t_activation_rep2.rds")
 t_act_tsnes <- purrr::map(t_act_l, function(seurat) {
   DimPlot(seurat, reduction = "tsne", cols = c("#999999", "#58315E", "#D36A55"))
 })
-saveRDS(t_act_tsnes, "results/R_objects/ggplots/tsnes_t_activation_rep2.rds")
+# saveRDS(t_act_tsnes, "results/R_objects/ggplots/tsnes_t_activation_rep2.rds")
 
 # View results
 iterable <- list(c("0_rep2_F2", "1_rep2_F2"), c("0_rep2_F3", "1_rep2_F3"))
 quali_intermix <- purrr::map(iterable, function(x) {
+  plot_list <- t_act_tsnes[x]
+  plot_list[[1]] <- plot_list[[1]] +
+    ggtitle("Original") +
+    theme(plot.title = element_text(hjust = 0.5, size = 13))
+  plot_list[[2]] <- plot_list[[2]] +
+    ggtitle("Cultured") +
+    theme(plot.title = element_text(hjust = 0.5, size = 13))
   p <- ggarrange(
-    plotlist = t_act_tsnes[x], 
+    plotlist = plot_list, 
     nrow = 1, 
     ncol = 2, 
     common.legend = TRUE, 
@@ -80,52 +87,6 @@ quali_intermix <- purrr::map(iterable, function(x) {
 })
 names(quali_intermix) <- c("female2", "female3")
 quali_intermix
-```
-
-# kBET
-
-```{r}
-acceptance_rates_l <- purrr::map(t_act_l, function(seurat) {
-  seurat$is_biased <- ifelse(seurat$time == "0h", FALSE, TRUE)
-  seurat <- pre_process_seurat(seurat)
-  DimPlot(seurat, reduction = "umap")
-  mat <- as.matrix(seurat@reductions$umap@cell.embeddings)
-  batch <- seurat$is_biased
-  batch_estimate <- kBET(mat, batch = batch, verbose = TRUE, heuristic = FALSE, testSize = 50)
-  batch_results <- batch_estimate$results
-  batch_results <- batch_results %>% 
-    dplyr::mutate(cell_type = seurat$cell_type) %>% 
-    dplyr::filter(tested == 1) %>% 
-    dplyr::group_by(cell_type) %>%
-    dplyr::summarise(acceptance_rate = mean(kBET.pvalue.test > 0.05) * 100)
-  batch_results
-})
-acceptance_rates_l <- purrr::map(acceptance_rates_l, function(df) {
-  df <- dplyr::filter(df, cell_type != "Dendritic Cell" & cell_type != "Mitotic") # not enough cells
-  df$cell_type[df$cell_type == "T"] <- "T-cell"
-  df$cell_type[df$cell_type == "CD4 T"] <- "CD4 T-cell"
-  df$cell_type[df$cell_type == "Activated T"] <- "Activated T-cell"
-  df$cell_type[df$cell_type == "Cycling T"] <- "Cycling T-cell"
-  df$cell_type[df$cell_type == "B"] <- "B-cell"
-  df
-})
-kbet_gg <- purrr::map(iterable, function(x) {
-  df <- bind_rows(acceptance_rates_l[x], .id = "day")
-  p <- df %>%    
-    dplyr::mutate(day = ifelse(str_detect(day, "0"), "Original", "Cultured")) %>% 
-    dplyr::mutate(day = factor(day, levels = c("Original", "Cultured"))) %>% 
-    ggplot(aes(cell_type, acceptance_rate)) +
-    geom_col(color = "black") +
-    scale_y_continuous(limits = c(0, 100)) +
-    labs(x = "", y = "kBET (acceptance rate)") +
-    facet_grid(. ~ day, scales = "free_x") +
-    theme_classic()
-})
-names(kbet_gg) <- c("female2", "female3")
-kbet_gg
-acc_rate_m_gg
-saveRDS(acc_rate_m_gg, "results/R_objects/ggplots/barplot_kBET_t_act_rep2.rds")
-saveRDS(t_act_l$`2M`, "results/R_objects/t_act_seurat_2M_rep2.rds")
 ```
 
 # Cold-shock Score
@@ -163,7 +124,7 @@ cold_shock_violins <- purrr::map(cold_shock_dfs, function(df) {
 })
 names(cold_shock_violins) <- c("female2", "female3")
 cold_shock_violins
-saveRDS(cold_shock_violins, "results/R_objects/ggplots/boxplot_cold_shock_t_act_rep2.rds")
+# saveRDS(cold_shock_violins, "results/R_objects/ggplots/boxplot_cold_shock_t_act_rep2.rds")
 ```
 
 # Session Info
