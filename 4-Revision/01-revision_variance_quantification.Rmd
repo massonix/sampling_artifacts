@@ -1,0 +1,355 @@
+---
+title: "Revision: Variance Quantification"
+author: "Ramon Massoni-Badosa"
+date: "3/3/2020"
+output: 
+  BiocStyle::html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, out.width = "100%", fig.align='center', 
+                      message=FALSE, warning = FALSE)
+options(width = 1200)
+```
+
+# Introduction
+
+In the following notebooks, we will perform the analysis requested by the reviewers to shed light into unclear parts of the article and increase the overall robustness of our study. Specifically, we will divide the work into 4 notebooks, corresponding to the major actionable concerns of reviewer #2. On the contrary, the comments by reviewer #1 were mainly related to the introduction and discussion of the paper, so we focused on rephrasing those parts to convey our points more effectively.
+
+The objective of this notebook is to quantify and compare the variance introduced by sampling time more thoroughly. In our first version, we provided clear evidence that sampling time is a source of technical artifacts in scRNA-seq. However, the magnitude of this effect is still vague, specially in comparison with other drivers of variance.
+
+# Pre-processing
+
+## Package loading
+
+```{r}
+library(scater)
+library(Seurat)
+library(ggpubr)
+library(purrr)
+library(kBET)
+library(viridis)
+library(pheatmap)
+library(propr)
+library(cowplot)
+library(tidyverse)
+```            
+
+## Source script with function definitions
+
+```{r}
+source("bin/utils.R")
+```
+
+## Load data
+
+```{r}
+# PBMC
+pbmc <- readRDS("../1-PBMC/results/R_objects/10X_pbmc_Seurat_clustered.RDS")
+pbmc <- subset(pbmc, subset = condition %in% c("0h", "2h", "8h", "24h_RT", "48h_RT"))
+pbmc$time <- factor(pbmc$condition, levels = c("0h", "2h", "8h", "24h_RT", "48h_RT"))
+levels(pbmc$time) <-  c("0h", "2h", "8h", "24h", "48h")
+Idents(pbmc) <- "cell_type"
+
+# CLL
+cll <- readRDS("../2-CLL/results/R_objects/cll_seurat_annotated.rds")
+cll <- subset(cll, temperature == "RT")
+```
+
+
+# Drivers of cell-cell variability
+
+Herein, we will introduce *ρ* as a universal measure of cell similarity. In a benchmark of 17 cell-cell association metrics, [Skinnider *et al.*](https://www.nature.com/articles/s41592-019-0372-4) showed that measures of proportionality (ρ and ɸ) displayed the highest accuracy (considerably better than Pearson correlation). Thus, we will downsample T-cells and B-cells from the PBMC dataset and leukemic cells from the three patients in the CLL dataset and compute all cell-cell pairwise ρ. To achieve it, we will use the `perb()` function from the [propr](https://www.nature.com/articles/s41598-017-16520-0) package:
+
+```{r}
+pbmc_l <- SplitObject(pbmc, split.by = "cell_type")
+purrr:::map(pbmc_l, function(seurat) table(seurat$time))
+sizes <- c(50, 50, 50, 50)
+set.seed(1)
+pbmc_down_l <- purrr::map2(pbmc_l, sizes, function(seurat, x) {
+  print(seurat)
+  sizes2 <- ifelse(table(seurat$time) < x, table(seurat$time), x)
+  seurat_split <- SplitObject(seurat, split.by = "time")
+  seurat_split <- seurat_split[names(sizes2)]
+  cells_selected <- purrr::map2(seurat_split, sizes2, function(seurat2, x2) {
+    sample(colnames(seurat2), size = x2, replace = FALSE)
+  })
+  cells_selected <- unlist(cells_selected)
+  names(cells_selected) <- NULL
+  seurat_out <- SubsetData(seurat, cells = cells_selected)
+  seurat_out
+})
+cells_selected <- purrr::map(pbmc_down_l, colnames)
+cells_selected <- unlist(cells_selected)
+names(cells_selected) <- NULL
+pbmc_down <- SubsetData(pbmc, cells = cells_selected)
+cols <- viridis(5)
+heatmaps_cell_type <- purrr::map(pbmc_down_l, function(seurat) {
+  mat <- as.matrix(seurat[["RNA"]]@data)
+  mat <- mat[seurat[["RNA"]]@var.features, ]
+  corr_mat <- propr::perb(mat, select = colnames(mat))@matrix
+  diag(corr_mat) <- NA
+  annotation_row <- data.frame(time = seurat$time)
+  rownames(annotation_row) <- names(seurat$time)
+  annotation_col <- annotation_row
+  pheatmap(
+    corr_mat,
+    color = cols, 
+    cluster_rows = FALSE,
+    cluster_cols = FALSE,
+    show_rownames = FALSE,
+    show_colnames = FALSE,
+    annotation_row = annotation_row,
+    annotation_col = annotation_col
+  )
+})
+heatmaps_cell_type
+
+# T vs B
+pbmc_down_l2 <- pbmc_down_l[c("T", "B")]
+pbmc_down_l2 <- purrr::map(pbmc_down_l2, pre_process_seurat)
+cells_selected2 <- purrr::map(pbmc_down_l2, colnames)
+cells_selected2 <- unlist(cells_selected2)
+names(cells_selected2) <- NULL
+pbmc_down2 <- SubsetData(pbmc, cells = cells_selected2)
+mat <- as.matrix(pbmc_down2[["RNA"]]@data)
+features <- purrr::map(pbmc_down_l2, ~ .x[["RNA"]]@var.features)
+features <- unlist(features)
+names(features) <- NULL
+features <- c(features, pbmc_down2[["RNA"]]@var.features)
+features <- unique(features)
+mat <- mat[features, ]
+corr_mat <- propr::perb(mat, select = colnames(mat))@matrix
+diag(corr_mat) <- NA
+annotation_row <- data.frame(type = pbmc_down2$cell_type, time = pbmc_down2$time)
+annotation_row$type <- droplevels(annotation_row$type)
+levels(annotation_row$type) <- c("T-cell", "B-cell")
+rownames(annotation_row) <- names(pbmc_down2$time)
+colorRampPalette(c("blue", "white", "red"))(10)
+annotation_col <- annotation_row
+ann_colors <- list(
+  type = c("T-cell" = "#c20a35", "B-cell" = "#bbaa2a"),
+  time = c("0h" = "#999999", "2h" = "#92e8df", "8h" = "#632c63", "24h" = "#e4624e", "48h" = "#c0e212")
+)
+heatmap_pbmc <- pheatmap(
+  corr_mat,
+  color = colorRampPalette(c("blue", "white", "red"))(20), 
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  show_rownames = FALSE,
+  show_colnames = FALSE,
+  annotation_row = annotation_row,
+  annotation_col = annotation_col,
+  annotation_colors = ann_colors,
+  legend = TRUE
+)
+heatmap_pbmc
+# saveRDS(heatmap_pbmc, "results/R_objects/heatmap_pbmc_cell2cell_association.rds")
+
+# CLL
+Idents(cll) <- "cell_type"
+cll_sub <- subset(cll, idents = c("CLL 1220", "CLL 1472", "CLL 1892"))
+cll_sub$cell_type <- droplevels(cll_sub$cell_type)
+cll_l <- SplitObject(cll_sub, split.by = "cell_type")
+size <- 50
+set.seed(1)
+cll_down_l <- purrr::map(cll_l, function(seurat) {
+  print(seurat)
+  sizes2 <- ifelse(table(seurat$time) < size, table(seurat$time), size)
+  seurat_split <- SplitObject(seurat, split.by = "time")
+  seurat_split <- seurat_split[names(sizes2)]
+  cells_selected <- purrr::map2(seurat_split, sizes2, function(seurat2, x2) {
+    sample(colnames(seurat2), size = x2, replace = FALSE)
+  })
+  cells_selected <- unlist(cells_selected)
+  names(cells_selected) <- NULL
+  seurat_out <- SubsetData(seurat, cells = cells_selected)
+  seurat_out
+})
+cells_selected <- purrr::map(cll_down_l, colnames)
+cells_selected <- unlist(cells_selected)
+names(cells_selected) <- NULL
+cll_down <- SubsetData(cll_sub, cells = cells_selected)
+mat <- as.matrix(cll_down[["RNA"]]@data)
+cll_down_l <- purrr::map(cll_down_l, pre_process_seurat)
+features_cll <- purrr::map(cll_down_l, ~ .x[["RNA"]]@var.features)
+features_cll <- unlist(features_cll)
+names(features_cll) <- NULL
+features_cll <- c(features_cll, cll_down[["RNA"]]@var.features)
+features_cll <- unique(features_cll)
+mat <- mat[features_cll, ]
+corr_mat <- propr::perb(mat, select = colnames(mat))@matrix
+diag(corr_mat) <- NA
+annotation_row <- data.frame(donor = cll_down$cell_type, time = cll_down$time)
+rownames(annotation_row) <- names(cll_down$time)
+annotation_col <- annotation_row
+ann_colors <- list(
+  donor = c("CLL 1220" = "red", "CLL 1472" = "green", "CLL 1892" = "blue"),
+  time = c("0h" = "#999999", "2h" = "#92e8df", "4h" = "yellow2", "6h" = "limegreen", "8h" = "#632c63", "24h" = "#e4624e")
+)
+heatmap_cll <- pheatmap(
+  corr_mat,
+  color = viridis(10), 
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  show_rownames = FALSE,
+  show_colnames = FALSE,
+  annotation_row = annotation_row,
+  annotation_col = annotation_col,
+  annotation_colors = ann_colors,
+  legend = TRUE
+)
+heatmap_cll
+# pdf(file = "results/plots/heatmap_dist_mat_cll.pdf", width = 5, height = 5, "cm")
+# heatmap_cll
+# dev.off()
+# saveRDS(heatmap_cll, "results/R_objects/heatmap_cll_cell2cell_association.rds")
+```
+
+As we can see, and consistent with our initial findings, cell type and sampling time are first and second largest sources of variance in the PBMC dataset, respectively. On the other hand, patient and sampling time are the greatest drivers of variance in the CLL dataset, which is consistent with the [large interpatient variability observed in CLL](https://genome.cshlp.org/content/24/2/212.abstract).
+
+
+# Regression analysis
+
+As a complementary analysis, we will regress the gene expression values of 5,282 genes on one of four explanatory variables (cell type, time, donor and batch), and extract a distribution of r2 values for each variable:
+
+```{r}
+# Simple regression
+features_cell_types <- purrr::map(pbmc_down_l, function(seurat) {
+  seurat <- FindVariableFeatures(seurat)
+  seurat[["RNA"]]@var.features
+})
+pbmc_down <- FindVariableFeatures(pbmc_down)
+features_cell_types[["merged"]] <- pbmc_down[["RNA"]]@var.features
+features <- Reduce(union, features_cell_types)
+metadata <- pbmc_down@meta.data[, c("cell_type", "time", "donor", "batch")]
+metadata$time <- factor(metadata$time, levels = levels(metadata$time), ordered = TRUE)
+metadata$donor <- factor(metadata$donor, levels = c("male", "female"))
+metadata$batch <- factor(metadata$batch, levels = c("JULIA_03", "JULIA_04"))
+features_lm_l <- purrr::map(features, function(gene) {
+  df <- cbind(metadata, pbmc_down[["RNA"]]@data[gene, ])
+  names(df) <- c(names(metadata), "gene")
+  r2_cell_type <- summary(lm(gene ~ cell_type, data = df))$r.squared
+  r2_time <- summary(lm(gene ~ time, data = df))$r.squared
+  r2_donor <- summary(lm(gene ~ donor, data = df))$r.squared
+  r2_batch <- summary(lm(gene ~ batch, data = df))$r.squared
+  out <- data.frame(
+    r2 = c(r2_cell_type, r2_time, r2_donor, r2_batch),
+    explanatory_variable = c("cell_type", "time", "donor", "batch"),
+    gene = rep(gene, 4)
+  )
+  out
+})
+names(features_lm_l) <- features
+features_lm_df <- bind_rows(features_lm_l)
+features_lm_df$explanatory_variable <- factor(
+  features_lm_df$explanatory_variable,
+  levels = c("cell_type", "time", "donor", "batch")
+)
+levels(features_lm_df$explanatory_variable) <- c("cell type", "time", "donor", "batch")
+features_lm_gg <- features_lm_df %>% 
+  ggplot(aes(explanatory_variable, log10(r2))) +
+    geom_violin(fill = "darkgrey", alpha = 0.6) +
+    geom_boxplot(width = 0.1, fill = "white", outlier.size = 0.1) +
+    labs(x = "", y = expression(log[10]~(r^{2}))) +
+    theme_classic() +
+    theme(legend.position = "none",
+          axis.title.y = element_text(size = 13),
+          axis.text.x = element_text(size = 11, color = "black"))
+# ggsave(
+#   plot = features_lm_gg,
+#   filename = "results/plots/boxplot_r2_all.pdf",
+#   height = 6,
+#   width = 9,
+#   units = "cm"
+# )
+features_lm_gg
+
+# Stratified by cell type
+metadata_dfs <- purrr::map(pbmc_down_l, function(seurat) {
+  metadata <- seurat@meta.data[, c("time", "donor", "batch")]
+  metadata$time <- factor(metadata$time, levels = levels(metadata$time), ordered = TRUE)
+  metadata$donor <- factor(metadata$donor, levels = c("male", "female"))
+  metadata$batch <- factor(metadata$batch, levels = c("JULIA_03", "JULIA_04"))
+  metadata
+})
+features_lm_by_ct <- purrr::map2(pbmc_down_l, metadata_dfs, function(seurat, metadata) {
+  features_lm_l <- purrr::map(features, function(gene) {
+    df <- cbind(metadata, seurat[["RNA"]]@data[gene, ])
+    names(df) <- c(names(metadata), "gene")
+    r2_time <- summary(lm(gene ~ time, data = df))$r.squared
+    r2_donor <- summary(lm(gene ~ donor, data = df))$r.squared
+    r2_batch <- summary(lm(gene ~ batch, data = df))$r.squared
+    out <- data.frame(
+      r2 = c(r2_time, r2_donor, r2_batch),
+      explanatory_variable = c("time", "donor", "batch"),
+      gene = rep(gene, 3)
+    )
+    out
+  })
+  names(features_lm_l) <- features
+  features_lm_df <- bind_rows(features_lm_l)
+  features_lm_df$explanatory_variable <- factor(
+    features_lm_df$explanatory_variable,
+    levels = c("time", "donor", "batch")
+  )
+  features_lm_df
+})
+features_lm_by_ct <- bind_rows(features_lm_by_ct, .id = "cell_type")
+palette2 <- c("#c20a35", "#aa2edc", "#71bdd0", "#bbaa2a")
+cell_types <- c("T", "NK", "Monocyte", "B")
+features_lm_by_ct$cell_type <- factor(features_lm_by_ct$cell_type, levels = cell_types)
+levels(features_lm_by_ct$cell_type) <- c("T-cell", "NK", "Monocyte", "B-cell")
+features_gg_by_ct <- features_lm_by_ct %>%
+    ggplot(aes(explanatory_variable, log10(r2), fill = cell_type)) +
+    # geom_violin() +
+    geom_boxplot(outlier.shape = NA) +
+    facet_grid(.~cell_type) +
+    labs(x = "", y = expression(log[10]~(r^{2}))) +
+    scale_y_continuous(limits = c(-5, 0 )) +
+    scale_fill_manual(values = palette2) +
+    theme_classic() +
+    theme(strip.text = element_text(size = 13),
+          legend.position = "none",
+          axis.title.y = element_text(size = 13),
+          axis.text.x = element_text(size = 11, color = "black"))
+features_gg_by_ct
+# ggsave(
+#   plot = features_gg_by_ct,
+#   filename = "results/plots/boxplot_r2_by_cell_type.pdf",
+#   width = 19,
+#   height = 6,
+#   units = "cm"
+# )
+# p <- readRDS("../1-PBMC/results/R_objects/pct_variance_explained_pc1.rds")
+# ggsave(
+#   plot = p,
+#   filename = "results/plots/pct_variance_explained_pc1.pdf",
+#   width = 19,
+#   height = 6,
+#   units = "cm"
+# )
+```
+
+# Arrange figure
+
+```{r}
+# fig_row1 <- p
+# fig_row2 <- plot_grid(heatmap_pbmc[[4]], NULL, heatmap_cll[[4]], ncol = 3,
+#                       rel_widths = c(1, 0.05, 1))
+# fig_row3 <- features_gg_by_ct
+# fig <- plot_grid(fig_row1, NULL, fig_row2, NULL, fig_row3, nrow = 5,
+#                  rel_widths = c(1, 0.05, 1, 0.05, 1))
+# fig
+# ggsave(plot = fig, filename = "../doc/figures/R/supp_variance.pdf", width = 18.5, height = 22.5, units = "cm")
+```
+
+# Session Information
+
+```{r}
+sessionInfo()
+```
+
