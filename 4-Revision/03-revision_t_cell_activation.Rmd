@@ -1,0 +1,402 @@
+---
+title: "Revision: T-cell activation"
+author: "Ramon Massoni-Badosa"
+date: "3/13/2020"
+output: 
+  BiocStyle::html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, out.width = "100%", fig.align='center', 
+                      message=FALSE, warning = FALSE)
+options(width = 1200)
+```
+
+# Introduction
+
+Reviewer #2 requested the following analysis for the T-cell activation and culturing experiment:
+
+- Characterization of the transcriptomic changes associated with exposure to anti-CD3 antibody.
+- Compositional analysis of cell types with and without anti-CD3 antibody treatment.
+
+# Pre-processing
+
+## Package loading
+
+```{r}
+library(scater)
+library(Seurat)
+library(ggpubr)
+library(purrr)
+library(kBET)
+library(viridis)
+library(ggmap)
+library(cowplot)
+library(tidyverse)
+```            
+
+## Source script with functions
+
+```{r}
+source("bin/utils.R")
+```
+
+## Load data
+
+```{r}
+t_act_male1 <- readRDS("../3-T_cell_activation/results/R_objects/t_act_Seurat_male1.rds")
+t_act_rep2_l <- readRDS("../3-T_cell_activation/results/R_objects/t_act_Seurat_list_reannotated_rep2.rds")
+```
+
+## Merge seurat objects and homogenize annotations
+
+```{r}
+# Donor 1
+t_act_male1$`0M`$cell_type <- factor(
+  t_act_male1$`0M`$cell_type,
+  levels = c("CD4 T", "Cytotoxic", "Monocyte", "B", "FCGR3A Monocyte", "Dendritic Cell")
+)
+levels(t_act_male1$`0M`$cell_type) <- c("CD4 T-cell", "Cytotoxic", "CD14 Monocyte", "B-cell",
+                              "FCGR3A Monocyte", "Dendritic Cell")
+t_act_male1$`2M`$cell_type <- factor(
+  t_act_male1$`2M`$cell_type,
+  levels = c("CD4 T", "Cycling", "Cytotoxic", "B")
+)
+levels(t_act_male1$`2M`$cell_type) <- c("Activated CD4 T-cell", "Cycling CD4 T-cell",
+                                        "Cytotoxic", "B-cell")
+t_act_male1$`0M`$is_cultured <- rep("uncultured", ncol(t_act_male1$`0M`))
+t_act_male1$`2M`$is_cultured <- rep("cultured", ncol(t_act_male1$`2M`))
+t_act_male1 <- merge(
+  x = t_act_male1$`0M`,
+  y = t_act_male1$`2M`,
+  add.cell.ids = c("uncultured", "cultured")
+)
+t_act_male1$donor <- rep("donor1", ncol(t_act_male1))
+
+# Donor 2
+t_act_rep2_l$`0_rep2_F2`$cell_type <- factor(
+  t_act_rep2_l$`0_rep2_F2`$cell_type,
+  levels = c("CD4 T-cell", "CD8 T-cell", "NK", "B-cell", "Monocyte", "FCGR3A Monocyte", "Unknown")
+)
+levels(t_act_rep2_l$`0_rep2_F2`$cell_type) <- c("CD4 T-cell", "CD8 T-cell", "NK",
+                                                "B-cell", "CD14 Monocyte", "FCGR3A Monocyte",
+                                                "Unknown")
+t_act_rep2_l$`1_rep2_F2`$cell_type <- factor(
+  t_act_rep2_l$`1_rep2_F2`$cell_type,
+  levels = c("Activated CD4 T-cell", "Cycling CD4 T-cell", "CD8 T-cell", "NK", "B-cell", "Unknown")
+)
+
+t_act_rep2_l$`0_rep2_F2`$is_cultured <- rep("uncultured", ncol(t_act_rep2_l$`0_rep2_F2`))
+t_act_rep2_l$`1_rep2_F2`$is_cultured <- rep("cultured", ncol(t_act_rep2_l$`1_rep2_F2`))
+t_act_female2 <- merge(
+  x = t_act_rep2_l$`0_rep2_F2`,
+  y = t_act_rep2_l$`1_rep2_F2`,
+  add.cell.ids = c("uncultured", "cultured")
+)
+t_act_female2$donor <- rep("donor2", ncol(t_act_female2))
+
+# Donor 3
+t_act_rep2_l$`0_rep2_F3`$cell_type <- factor(
+  t_act_rep2_l$`0_rep2_F3`$cell_type,
+  levels = c("CD4 T-cell", "CD8 T-cell", "NK", "B-cell", "Monocyte", "FCGR3A Monocyte")
+)
+levels(t_act_rep2_l$`0_rep2_F3`$cell_type) <- c("CD4 T-cell", "CD8 T-cell", "NK",
+                                                "B-cell", "CD14 Monocyte", "FCGR3A Monocyte")
+t_act_rep2_l$`1_rep2_F3`$cell_type <- factor(
+  t_act_rep2_l$`1_rep2_F3`$cell_type,
+  levels =  c("Activated CD4 T-cell", "Cycling CD4 T-cell", "CD8 T-cell", "NK", "B-cell", "Unknown")
+)
+t_act_rep2_l$`0_rep2_F3`$is_cultured <- rep("uncultured", ncol(t_act_rep2_l$`0_rep2_F3`))
+t_act_rep2_l$`1_rep2_F3`$is_cultured <- rep("cultured", ncol(t_act_rep2_l$`1_rep2_F3`))
+t_act_female3 <- merge(
+  x = t_act_rep2_l$`0_rep2_F3`,
+  y = t_act_rep2_l$`1_rep2_F3`,
+  add.cell.ids = c("uncultured", "cultured")
+)
+t_act_female3$donor <- rep("donor3", ncol(t_act_female3))
+
+# Create list
+t_act_l <- list(t_act_male1, t_act_female2, t_act_female3)
+names(t_act_l) <- c("donor1", "donor2", "donor3")
+
+t_act_l$donor1$cell_type <- factor(
+  t_act_l$donor1$cell_type,
+  levels = c("CD4 T-cell", "Activated CD4 T-cell", "Cycling CD4 T-cell", "Cytotoxic",
+             "B-cell", "CD14 Monocyte", "FCGR3A Monocyte", "Dendritic Cell")
+)
+levels_type_female <- c("CD4 T-cell", "Activated CD4 T-cell", "Cycling CD4 T-cell",
+                        "CD8 T-cell", "NK", "B-cell", "CD14 Monocyte", "FCGR3A Monocyte",
+                        "Unknown")
+t_act_l$donor2$cell_type <- factor(
+  t_act_l$donor2$cell_type,
+  levels = levels_type_female
+)
+t_act_l$donor3$cell_type <- factor(
+  t_act_l$donor3$cell_type,
+  levels = levels_type_female
+)
+t_act_sub_l <- purrr::map(t_act_l, function(seurat) {
+  Idents(seurat) <- "time"
+  seurat_sub <- subset(seurat, idents = "0h")
+  seurat_sub <- seurat_sub %>%
+  FindVariableFeatures() %>%
+  ScaleData() %>% 
+  RunPCA() %>% 
+  RunTSNE(reduction = "pca", dims = 1:30) %>%
+  RunUMAP(reduction = "pca", dims = 1:30)
+  Idents(seurat_sub) <- "cell_type"
+  seurat_sub
+})
+```
+
+# tSNE uncultured/cultured
+
+```{r fig.wide=TRUE}
+donors <- c("Donor 1", "Donor 2", "Donor 3")
+tsnes_is_cultured <- purrr::map2(t_act_sub_l, donors, function(seurat, titl) {
+  Idents(seurat) <- "is_cultured"
+  tsne <- DimPlot(
+    seurat,
+    reduction = "tsne",
+    pt.size = 0.5,
+    cols = c("#3374A1", "#E1812C")
+  )
+  tsne +
+    labs(title = titl, x = "tSNE1", y = "tSNE2") +
+    scale_color_manual("", values = c("#3374A1", "#E1812C"),
+                       labels = c("Original", "Cultured")) +
+    theme(plot.title = element_text(size = 13, hjust = 0.5),
+          axis.ticks = element_blank(),
+          axis.text = element_blank(),
+          axis.title = element_blank(),
+          axis.line = element_blank())
+})
+tsnes_is_cultured_arr <- ggarrange(
+  plotlist = tsnes_is_cultured,
+  ncol = 3,
+  common.legend = TRUE
+)
+tsnes_is_cultured_arr
+
+# Get legend
+p <- tsnes_is_cultured$donor1 + theme(legend.position = "bottom")
+leg <- as_ggplot(get_legend(p))
+date <- Sys.Date()
+# ggsave(
+#   filename = str_c("../doc/figures/legends/", date, "_", "is_cultured", ".pdf"), 
+#   plot = leg, 
+#   width = 16, 
+#   height = 5,
+#   units = "cm"
+# )
+```
+
+# tSNE cell types
+
+```{r fig.wide=TRUE}
+all_cell_types <- c("CD4 T-cell", "Activated CD4 T-cell", "Cycling CD4 T-cell", "Cytotoxic",
+                    "CD8 T-cell", "NK", "B-cell", "CD14 Monocyte", "FCGR3A Monocyte",
+                    "Dendritic Cell", "Unknown")
+all_cell_types <- factor(all_cell_types, levels = all_cell_types)
+palette <- c("#81324c", "#b82e57", "#e04d74", "#3a2edb", "#752bbf",
+             "#c03fe4", "#bbaa2a", "#71bdd0", "green4", "hotpink2",
+             "gray50")
+names(palette) <- all_cell_types
+tsnes_cell_type <- purrr::map(t_act_sub_l, function(seurat) {
+  tsne <- DimPlot(
+    seurat,
+    reduction = "tsne",
+    pt.size = 0.5,
+    cols = palette[levels(seurat$cell_type)]
+  )
+  tsne +
+    labs(x = "tSNE1", y = "tSNE2") +
+    theme(axis.ticks = element_blank(),
+          axis.text = element_blank(),
+          axis.title = element_blank(),
+          axis.line = element_blank())
+})
+tsnes_cell_type_arr <- ggarrange(
+  plotlist = tsnes_cell_type,
+  ncol = 3,
+  common.legend = TRUE
+)
+tsnes_cell_type_arr
+```
+
+
+# Cell cycle score
+
+[Garcia-Sousa I, et al.](https://bmcgenomics.biomedcentral.com/articles/10.1186/s12864-019-5967-8#Sec20) showed that the major biological process activated upon treatment with an anti-CD3 antibody is cell cycle. Let us score each cell with a cell cycle transcriptomic signature:
+
+```{r fig.wide=TRUE}
+tsnes_s_score <- purrr::map(t_act_sub_l, function(seurat) {
+  tsne <- FeaturePlot(
+    seurat,
+    reduction = "tsne",
+    feature = "S.Score",
+    pt.size = 0.5,
+    cols = viridis(5)
+  )
+  tsne +
+    labs(x = "tSNE1", y = "tSNE2") +
+    theme(axis.ticks = element_blank(),
+          axis.text = element_blank(),
+          axis.title = element_blank(),
+          axis.line = element_blank(),
+          plot.title = element_blank())
+})
+tsnes_s_score_arr <- ggarrange(plotlist = tsnes_s_score, ncol = 3)
+tsnes_s_score_arr
+
+# Get legend
+p <- tsnes_s_score$donor1
+leg <- as_ggplot(get_legend(p))
+# ggsave(
+#   filename = str_c("../doc/figures/legends/", date, "_", "s_phase_score", ".pdf"), 
+#   plot = leg, 
+#   width = 16, 
+#   height = 5,
+#   units = "cm"
+# )
+```
+
+
+# Compositional analysis
+
+```{r fig.wide=TRUE}
+donors <- c("Donor 1", "Donor 2", "Donor 3")
+compositional_analysis_gg <- purrr::map(t_act_sub_l, function(seurat) {
+  df <- seurat@meta.data %>%
+    dplyr::select("is_cultured", "cell_type") %>% 
+    group_by(is_cultured, cell_type) %>% 
+    summarise(n_cells = n()) %>% 
+    ungroup() %>% 
+    group_by(is_cultured) %>% 
+    mutate(pct_cells = n_cells / sum(n_cells) * 100)
+  df$is_cultured <- factor(df$is_cultured, levels = c("uncultured", "cultured"))
+  p <- df %>% 
+    ggplot(aes(is_cultured, pct_cells, fill = cell_type)) +
+      geom_col() +
+      labs(x = "", y = "Percentage of cells (%)", fill = "") +
+      scale_x_discrete(labels = c("Original", "Cultured")) +
+      scale_fill_manual(values = palette[levels(seurat$cell_type)]) +
+      theme_classic() +
+      theme(plot.title = element_text(size = 13, hjust = 0.5),
+            axis.title.y = element_text(size = 12),
+            axis.text.x = element_text(size = 11, color = "black"))
+  p
+})
+compositional_analysis_arr <- ggarrange(
+  plotlist = compositional_analysis_gg,
+  ncol = 3,
+  common.legend = TRUE
+)
+compositional_analysis_arr
+
+# Get legend
+p1 <- compositional_analysis_gg$donor1 +
+  theme(legend.position = "bottom")
+p2 <- compositional_analysis_gg$donor2 +
+  theme(legend.position = "bottom")
+leg1 <- as_ggplot(get_legend(p1))
+leg2 <- as_ggplot(get_legend(p2))
+leg_list <- list(cell_types1 = leg1, cell_types2 = leg2)
+date <- Sys.Date()
+# walk(names(leg_list), function(leg) {
+#   ggsave(
+#     filename = str_c("../doc/figures/legends/", date, "_", leg, ".pdf"), 
+#     plot = leg_list[[leg]], 
+#     width = 16, 
+#     height = 5,
+#     units = "cm"
+#   )
+# })
+```
+
+# Arrange figure
+
+```{r}
+fig <- plot_grid(tsnes_is_cultured_arr, NULL, tsnes_cell_type_arr, NULL, tsnes_s_score_arr,
+                 NULL, compositional_analysis_arr, nrow = 7, ncol = 1,
+                 rel_heights = c(1, 0.05, 1, 0.1, 1, 0.05, 1))
+# fig
+# ggsave(filename = "../doc/figures/R/suppZZ.pdf", plot = fig, width = 18.5, height = 27.5, units = "cm")
+```
+
+
+# Differential expression analysis (cultured VS uncultured)
+
+```{r}
+# Merge
+t_act <- merge(
+  x = t_act_l$donor1,
+  y = c(t_act_l$donor2, t_act_l$donor3)
+)
+
+# Process
+t_act <- t_act %>%
+  FindVariableFeatures() %>% 
+  ScaleData() %>%
+  RunPCA() %>% 
+  RunTSNE(reduction = "pca", dims = 1:30) %>% 
+  RunUMAP(reduction = "pca", dims = 1:30)
+Idents(t_act) <- "donor"
+DimPlot(t_act)
+t_act$cell_type[t_act$cell_type %in% c("NK", "CD8 T-cell")] <- "Cytotoxic"
+Idents(t_act) <- "cell_type"
+t_act <- subset(
+  t_act,
+  idents = c("CD4 T-cell", "Activated CD4 T-cell", "Cytotoxic", "B-cell")
+)
+
+# DEA
+t_act$cell_type[t_act$cell_type == "Activated CD4 T-cell"] <- "CD4 T-cell"
+Idents(t_act) <- "cell_type"
+types <- c("CD4 T-cell", "Cytotoxic", "B-cell")
+t_act_types <- SplitObject(t_act, split.by = "cell_type")
+dea_l <- purrr::map2(t_act_types, types, function(seurat, type) {
+  Idents(seurat) <- "is_cultured"
+  df <- FindMarkers(
+    seurat,
+    ident.1 = "cultured",
+    ident.2 = "uncultured",
+    test.use = "wilcox",
+    logfc.threshold = 0
+  )
+  df
+})
+dea_df_l <- purrr::map2(dea_l, t_act_types, function(df, seurat) {
+  mat <- as.matrix(seurat[["RNA"]]@data[rownames(df), ])
+  average_expression <- rowMeans(mat)
+  log2_fc <- apply(mat, 1, function(x) {
+    mean_uncultured <- mean(x[seurat$is_cultured == "uncultured"]) + 0.05
+    mean_cultured <- mean(x[seurat$is_cultured == "cultured"]) + 0.05
+    log2(mean_cultured / mean_uncultured)
+  })
+  df <- df %>%
+    rownames_to_column(var = "gene") %>% 
+    dplyr::select("gene", "p_val", "p_val_adj") %>% 
+    dplyr::mutate(average_expression = average_expression, log2_fc = log2_fc) %>% 
+    dplyr::arrange(p_val_adj) %>%
+    dplyr::filter(p_val_adj < 0.001)
+  df <- df[, c("gene", "average_expression", "log2_fc", "p_val", "p_val_adj")]
+  df
+})
+DT::datatable(dea_df_l$`CD4 T-cell`)
+DT::datatable(dea_df_l$Cytotoxic)
+DT::datatable(dea_df_l$`B-cell`)
+# openxlsx::write.xlsx(dea_df_l, file = "results/tables/dea_culturedVSuncultured.xlsx")
+```
+
+
+# Session Information
+
+```{r}
+sessionInfo()
+```
+
+
