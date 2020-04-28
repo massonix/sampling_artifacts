@@ -56,15 +56,18 @@ Bioconductor:
 
 ## File system and name scheme
 
+This repository contains 4 different analysis directories (which correspond to the main blocks of the article) and 1 directory with the scripts to produce the figures of the article:
 
-* 1-PBMC:
-* 2-CLL:
-* 3-T_cell_activation:
-* 4-Revision:
+* 1-PBMC
+* 2-CLL
+* 3-T_cell_activation
+* 4-Revision
+* figures_scripts
 
-reports VS notebooks VS bin VS data
+The first 3 have a set of similar notebooks, which match the common pre-processing steps of any single-cell expression matrix:
 
+1. Demultiplexing: classify each cell to its original condition based on the expression of HTO.
+2. QC and normalization: filter out poor-quality cells and genes and normalize expression counts.
+3. Dimensionality reduction, clustering and annotation of cell types.
 
-
-
-https://drive.google.com/drive/folders/1ZST33kPXpc0f1Qs3NJ1fJ-A4IU313PFs?usp=sharing
+Finally, each notebook (*.Rmd) has an associated report (*.html). The reports are useful to visualize the results of each section as well as the diagnostic plots that we used to set the thresholds and parameters. For a quick inspection, one can copy the URL of the report in the [GitHub & BitBucket HTML Preview](https://htmlpreview.github.io/).
