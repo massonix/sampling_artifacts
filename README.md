@@ -70,4 +70,10 @@ The first 3 have a set of similar notebooks, which match the common pre-processi
 2. QC and normalization: filter out poor-quality cells and genes and normalize expression counts.
 3. Dimensionality reduction, clustering and annotation of cell types.
 
-Finally, each notebook (*.Rmd) has an associated report (*.html). The reports are useful to visualize the results of each section as well as the diagnostic plots that we used to set the thresholds and parameters. For a quick inspection, one can copy the URL of the report in the [GitHub & BitBucket HTML Preview](https://htmlpreview.github.io/).
+Each notebook (\*.Rmd) has an associated report (\*.html). The reports are useful to visualize the results of each section as well as the diagnostic plots that we used to set the thresholds and parameters. For a quick inspection, one can copy the URL of the report in the [GitHub & BitBucket HTML Preview](https://htmlpreview.github.io/) (note that side bar and table will not be available with it).
+
+Finally, the figures_scripts directory contains most of the scripts needed to produce the figures as they appear in the paper. The remaining supplementary figures are created either in the notebooks in 4-Revision, or were created by other coauthors.
+
+
+
+
