@@ -1,6 +1,6 @@
 # Sampling time-dependent artifacts in single-cell genomics studies
 
-This repository contains all the scripts, notebooks and reports to reproduce the scRNA-seq analysis of our paper ["Sampling time-dependent artifacts in single-cell genomics studies"](https://www.biorxiv.org/content/10.1101/2020.01.15.897066v1), published in Genome Biology in 2020. Here, we describe how to access the data, the most important packages and versions used, and how to navigate the directories and files in this repository.
+This repository contains all the scripts, notebooks and reports to reproduce the scRNA-seq analysis of our paper ["Sampling time-dependent artifacts in single-cell genomics studies"](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-020-02032-0), published in Genome Biology in 2020. Here, we describe how to access the data, the most important packages and versions used, and how to navigate the directories and files in this repository.
 
 ## Data
 
