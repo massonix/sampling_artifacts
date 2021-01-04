@@ -75,5 +75,17 @@ Each notebook (\*.Rmd) has an associated report (\*.html). The reports are usefu
 Finally, the figures_scripts directory contains most of the scripts needed to produce the figures as they appear in the paper. The remaining supplementary figures are created either in the notebooks in 4-Revision, or were created by other coauthors.
 
 
+## Other studies
 
+Here is a list of other important benchmarking studies:
 
+* [Single-cell sequencing reveals dissociation-induced gene expression in tissue subpopulations](Single-cell sequencing reveals dissociation-induced gene expression in tissue subpopulations).
+* [scRNA-seq assessment of the human lung, spleen, and esophagus tissue stability after cold preservation](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-019-1906-x).
+* [Dissociation of solid tumor tissues with cold active protease for single-cell RNA-seq minimizes conserved collagenase-associated stress responses](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-019-1830-0).
+* [Expression levels for many genes in human peripheral blood cells are highly sensitive to ex vivo incubation](https://www.nature.com/articles/6364098).
+* [Sample processing obscures cancer-specific alterations in leukemic transcriptomes](https://www.pnas.org/content/111/47/16802).
+* [A single-cell and single-nucleus RNA-Seq toolbox for fresh and frozen human tumors](https://www.nature.com/articles/s41591-020-0844-1).
+* [Multi-omic Single-cell Atlas Reveals Broad Ex Vivo Effects on Human Immunobiology](https://www.biorxiv.org/content/10.1101/2020.10.18.344663v4).
+* [ACME dissociation: a versatile cell fixation-dissociation method for single-cell transcriptomics](https://www.biorxiv.org/content/10.1101/2020.05.26.117234v2).
+* [Systematic assessment of tissue dissociation and storage biases in single-cell and single-nucleus RNA-seq workflows](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-020-02048-6).
+* [Single Cell Sequencing Reveals Glial Specific Responses to Tissue Processing & Enzymatic Dissociation in Mice and Humans](https://www.biorxiv.org/content/10.1101/2020.12.03.408542v1).
