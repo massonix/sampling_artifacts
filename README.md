@@ -79,7 +79,7 @@ Finally, the figures_scripts directory contains most of the scripts needed to pr
 
 Here is a list of other important benchmarking studies:
 
-* [Single-cell sequencing reveals dissociation-induced gene expression in tissue subpopulations](Single-cell sequencing reveals dissociation-induced gene expression in tissue subpopulations).
+* [Single-cell sequencing reveals dissociation-induced gene expression in tissue subpopulations](https://www.nature.com/articles/nmeth.4437).
 * [scRNA-seq assessment of the human lung, spleen, and esophagus tissue stability after cold preservation](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-019-1906-x).
 * [Dissociation of solid tumor tissues with cold active protease for single-cell RNA-seq minimizes conserved collagenase-associated stress responses](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-019-1830-0).
 * [Expression levels for many genes in human peripheral blood cells are highly sensitive to ex vivo incubation](https://www.nature.com/articles/6364098).
