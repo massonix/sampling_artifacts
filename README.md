@@ -91,3 +91,4 @@ Here is a list of other important benchmarking studies:
 * [Single Cell Sequencing Reveals Glial Specific Responses to Tissue Processing & Enzymatic Dissociation in Mice and Humans](https://www.biorxiv.org/content/10.1101/2020.12.03.408542v1).
 * [Cryopreservation of human cancers conserves tumour heterogeneity for single-cell multi-omics analysis](https://genomemedicine.biomedcentral.com/articles/10.1186/s13073-021-00885-z?elqTrackId=283abc61b2f44964b72a610cb61f2b11&elq=2137b432e40849a3a608a59ec01ee7d3&elqaid=31262&elqat=1&elqCampaignId=10610)
 * [Single-cell transcriptome conservation in cryopreserved cells and tissues](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-017-1171-9)
+* [Stress relief: emerging methods to mitigate dissociation-induced artefacts](https://www.cell.com/trends/cell-biology/fulltext/S0962-8924(21)00096-9)
