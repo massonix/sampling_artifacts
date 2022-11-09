@@ -33,7 +33,7 @@ A total of 3 files per library are needed to reconstruct the full expression mat
 3. matrix*mtx.gz: expression matrix in sparse format.
 
 
-To make our data as FAIR (findable, accessible, interoperable, reusable) as possible, we have deposited the gene expression matrices and the Seurat objects that are saved in each of the Rmarkdown notebooks in [this Zenodo respository](https://zenodo.org/record/7308457#.Y2veY-zMJAc). One can downloaded in 3 lines of code:
+To make our data as FAIR (findable, accessible, interoperable, reusable) as possible, we have deposited the gene expression matrices and the Seurat objects that are saved in each of the Rmarkdown notebooks in [this Zenodo respository](https://zenodo.org/record/7308457#.Y2veY-zMJAc). One can download it in 3 lines of code:
 
 ```{bash}
 wget https://zenodo.org/record/7308457/files/MassoniBadosa2020_GenomeBiol_scRNAseq_data.zip
